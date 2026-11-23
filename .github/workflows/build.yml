@@ -1,0 +1,73 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-14
+            cmake_extra: -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          - name: Windows
+            os: windows-latest
+            cmake_extra: ""
+          - name: Linux
+            os: ubuntu-24.04
+            cmake_extra: ""
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libfreetype-dev libx11-dev libxext-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libfontconfig1-dev ninja-build xvfb
+
+      - name: Configure
+        shell: bash
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_extra }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: DSP tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: pluginval (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -sSL -o pluginval.zip https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Linux.zip
+          unzip -q pluginval.zip
+          xvfb-run -a ./pluginval --strictness-level 8 --validate "build/MasterBlaster_artefacts/Release/VST3/Master Blaster.vst3"
+
+      - name: pluginval (macOS, VST3 + AU)
+        if: runner.os == 'macOS'
+        run: |
+          curl -sSL -o pluginval.zip https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_macOS.zip
+          unzip -q pluginval.zip
+          ./pluginval.app/Contents/MacOS/pluginval --strictness-level 8 --validate "build/MasterBlaster_artefacts/Release/VST3/Master Blaster.vst3"
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          cp -R "build/MasterBlaster_artefacts/Release/AU/Master Blaster.component" ~/Library/Audio/Plug-Ins/Components/
+          killall -9 AudioComponentRegistrar || true
+          auval -v aufx Mbm1 Mbls
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp -R "build/MasterBlaster_artefacts/Release/VST3/Master Blaster.vst3" dist/
+          if [ -d "build/MasterBlaster_artefacts/Release/AU" ]; then cp -R "build/MasterBlaster_artefacts/Release/AU/Master Blaster.component" dist/; fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MasterBlaster-${{ matrix.name }}
+          path: dist
