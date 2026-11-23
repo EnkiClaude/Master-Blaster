@@ -87,6 +87,59 @@ int main (int argc, char** argv)
         plugin->setStateInformation (mb.getData(), (int) mb.getSize());
         check (ceil && std::abs (ceil->getValue() - before) < 1e-6f, "state save/restore round-trip");
 
+        // Fuzzed state restore (as pluginval does): random values, save, re-randomise, restore, compare.
+        {
+            Random rnd (sr == 44100.0 ? 11 : 12);
+            auto params = plugin->getParameters();
+            // Like pluginval, let the message loop run after setting values: the plugin
+            // snaps bool/choice values to whole steps on its own timer.
+            auto pump = [] { MessageManager::getInstance()->runDispatchLoopUntil (150); };
+            for (auto* prm : params) prm->setValueNotifyingHost (rnd.nextFloat());
+            pump();
+            std::vector<float> saved;
+            for (auto* prm : params)
+            {
+                // The state stores whole steps for bool/choice parameters, so a restore yields the snapped value.
+                float v = prm->getValue();
+                const int steps = prm->getNumSteps();
+                if (prm->isDiscrete() && steps > 1 && steps < 100) v = std::round (v * (float) (steps - 1)) / (float) (steps - 1);
+                saved.push_back (v);
+            }
+            MemoryBlock st;
+            plugin->getStateInformation (st);
+            // Second pass: continuous parameters get new random values. Discrete ones move
+            // off their step but stay inside it (saved "on" = 1.0 becomes 0.6), which is the
+            // case pluginval caught: the stored value doesn't change, so a plain
+            // replaceState() would leave the stray value in place.
+            for (size_t i = 0; i < saved.size(); ++i)
+            {
+                auto* prm = params[(int) i];
+                const int steps = prm->getNumSteps();
+                if (prm->isDiscrete() && steps > 1 && steps < 100)
+                    prm->setValueNotifyingHost (saved[i] + (saved[i] < 0.5f ? 1.0f : -1.0f) * 0.4f / (float) (steps - 1));
+                else
+                    prm->setValueNotifyingHost (rnd.nextFloat());
+            }
+            plugin->setStateInformation (st.getData(), (int) st.getSize());
+            pump();
+            int bad = 0;
+            String which;
+            for (size_t i = 0; i < saved.size(); ++i)
+            {
+                const auto name = params[(int) i]->getName (40);
+                if (name == "Bypass" || name == "Program") continue; // added by the VST3 wrapper, not plugin state
+                if (std::abs (params[(int) i]->getValue() - saved[i]) > 0.1f)
+                {
+                    ++bad;
+                    which << name << " (saved " << String (saved[i], 3) << ", got " << String (params[(int) i]->getValue(), 3) << ") ";
+                }
+            }
+            check (bad == 0, "fuzzed state restore @" + String (sr), which);
+            AudioBuffer<float> buf (2, 512); buf.clear();
+            plugin->processBlock (buf, midi);
+            for (auto* prm : params) prm->setValueNotifyingHost (prm->getDefaultValue());
+        }
+
         // A lookahead change must update the reported latency.
         if (auto* la = findParam (*plugin, "Lookahead"))
         {

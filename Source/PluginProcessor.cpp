@@ -128,6 +128,18 @@ void MasterBlasterProcessor::setStateInformation (const void* data, int sizeInBy
             currentPresetName = tree.getProperty ("presetName", "Default").toString();
             tree.removeChild (tree.getChildWithName ("Snapshots"), nullptr);
             state.replaceState (tree);
+            // replaceState only notifies parameters whose stored value changed. A bool or
+            // choice parameter set to an in-between normalised value (0.58, say) has the same
+            // stored value as the saved one, so it would keep the stray value. Push every
+            // saved value explicitly.
+            for (auto* p : getParameters())
+                if (auto* rp = dynamic_cast<juce::RangedAudioParameter*> (p))
+                {
+                    const auto child = tree.getChildWithProperty ("id", rp->getParameterID());
+                    if (! child.isValid() || ! child.hasProperty ("value")) continue;
+                    const float norm = rp->convertTo0to1 ((float) child.getProperty ("value"));
+                    if (std::abs (norm - rp->getValue()) > 1.0e-6f) rp->setValueNotifyingHost (norm);
+                }
             undoManager.clearUndoHistory();
         }
 }
