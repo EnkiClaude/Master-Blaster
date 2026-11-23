@@ -13,10 +13,10 @@ class Compressor
 {
 public:
     void prepare (double sr) { sampleRate = sr; reset(); }
-    void reset() { yL = 0.0; rmsState = 0.0; }
+    void reset() { yL = yF = yS = 0.0; rmsState = 0.0; }
 
     void setParams (double thresholdDb, double ratio, double kneeDb, double attackMs, double releaseMs,
-                    double rmsMs = 0.0) noexcept
+                    double rmsMs = 0.0, bool programDependentRelease = false) noexcept
     {
         thr = thresholdDb;
         slope = 1.0 - 1.0 / std::max (1.0, ratio);
@@ -24,6 +24,16 @@ public:
         aA = msToCoef (attackMs, sampleRate);
         aR = msToCoef (releaseMs, sampleRate);
         aRms = msToCoef (rmsMs, sampleRate);
+        autoRel = programDependentRelease;
+        // Program-dependent ("auto") release uses two envelopes:
+        //   fast: normal attack, release at 1/3 of the setting, so transients recover quickly;
+        //   slow: 15x slower attack and 4x slower release, so it tracks the sustained level.
+        // The gain reduction is the larger of the two. A drum hit dips briefly and
+        // comes straight back, while a dense passage settles into steady reduction
+        // instead of pumping.
+        aRFast = msToCoef (releaseMs / 3.0, sampleRate);
+        aASlow = msToCoef (attackMs * 15.0 + 50.0, sampleRate);
+        aRSlow = msToCoef (releaseMs * 4.0, sampleRate);
     }
 
     // Static curve: gain reduction in dB (>= 0) for an input level in dB.
@@ -48,18 +58,32 @@ public:
             level = std::sqrt (rmsState * 2.0); // a sine's RMS reads as its peak, so thresholds stay comparable
         }
         const double xL = staticReduction (gainToDb (level, -200.0));
-        yL = xL > yL ? aA * yL + (1.0 - aA) * xL : aR * yL + (1.0 - aR) * xL;
-        yL = undenorm (yL);
-        return dbToGain (-yL);
+        if (! autoRel)
+        {
+            yL = xL > yL ? aA * yL + (1.0 - aA) * xL : aR * yL + (1.0 - aR) * xL;
+            yL = undenorm (yL);
+        }
+        else
+        {
+            yF = xL > yF ? aA * yF + (1.0 - aA) * xL : aRFast * yF + (1.0 - aRFast) * xL;
+            yS = xL > yS ? aASlow * yS + (1.0 - aASlow) * xL : aRSlow * yS + (1.0 - aRSlow) * xL;
+            yF = undenorm (yF); yS = undenorm (yS);
+            yL = std::max (yF, yS);
+        }
+        lastGain = std::exp (-yL * 0.11512925464970229); // dB -> linear
+        return lastGain;
     }
 
     double getReductionDb() const noexcept { return yL; }
+    double getLastGain() const noexcept { return lastGain; }
 
 private:
     double sampleRate = 44100.0;
+    double lastGain = 1.0;
     double thr = 0.0, slope = 0.0, knee = 6.0;
-    double aA = 0.0, aR = 0.0, aRms = 0.0;
-    double yL = 0.0, rmsState = 0.0;
+    double aA = 0.0, aR = 0.0, aRms = 0.0, aRFast = 0.0, aASlow = 0.0, aRSlow = 0.0;
+    bool autoRel = false;
+    double yL = 0.0, yF = 0.0, yS = 0.0, rmsState = 0.0;
 };
 
 // Monotonic-deque sliding-window minimum (O(1) amortised per sample).
@@ -187,7 +211,7 @@ public:
         // Peak detection (the true-peak estimate lags the input by kDelay samples).
         const double pl = tp[0].process (l), pr = tp[1].process (r);
         double peak;
-        if (tpOn) peak = std::max (pl, pr);
+        if (tpOn) peak = std::max (pl, pr) * 1.007; // +0.06 dB covers the detector's residual error (< 0.05 dB to 0.45 fs)
         else
         {
             // Sample-peak mode: use the same alignment as the true-peak path.

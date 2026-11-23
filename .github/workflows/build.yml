@@ -20,7 +20,7 @@ jobs:
             cmake_extra: ""
           - name: Linux
             os: ubuntu-24.04
-            cmake_extra: ""
+            cmake_extra: -DMB_BUILD_HOST_CHECK=ON
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     steps:
@@ -42,6 +42,12 @@ jobs:
 
       - name: DSP tests
         run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Host + processor checks (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          xvfb-run -a ./build/mb_host_check_artefacts/Release/mb_host_check "build/MasterBlaster_artefacts/Release/VST3/Master Blaster.vst3"
+          xvfb-run -a ./build/mb_ui_snapshot_artefacts/Release/mb_ui_snapshot ui.png
 
       - name: pluginval (Linux)
         if: runner.os == 'Linux'
