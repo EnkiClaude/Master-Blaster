@@ -157,18 +157,19 @@ private:
 // peaks. ITU-R BS.1770-4 Annex 2 asks for at least 4x; 8x with 32-tap branches
 // keeps the worst-case underestimate for content up to 0.45 fs under ~0.15 dB.
 // It runs on the detector path only, so it never touches the audio.
-class TruePeakDetector
+template <int Over, int Taps, int BetaX10>
+class TruePeakDetectorT
 {
 public:
-    static constexpr int kOver = 8;
-    static constexpr int kTaps = 32;              // taps per polyphase branch
+    static constexpr int kOver = Over;
+    static constexpr int kTaps = Taps;            // taps per polyphase branch
     static constexpr int kDelay = kTaps / 2;      // base-rate delay of the estimate
 
-    TruePeakDetector()
+    TruePeakDetectorT()
     {
         const int len = kTaps * kOver + 1;
         const double centre = kTaps * kOver * 0.5;
-        const double beta = 7.0;
+        const double beta = BetaX10 * 0.1;
         auto bessel0 = [] (double v)
         {
             double sum = 1.0, term = 1.0;
@@ -203,21 +204,41 @@ public:
         hist[pos] = x;
         hist[pos + kTaps] = x; // mirrored so each read is one contiguous span
         const double* h = &hist[pos + 1]; // h[kTaps-1] is the newest sample
-        double peak = std::max (std::abs (h[kTaps - 1 - kDelay]), std::abs (h[kTaps - kDelay]));
+        // v[0] = x[n-D], v[kOver] = x[n-D+1], interpolated points in between
+        std::array<double, (size_t) kOver + 1> v {};
+        v[0] = h[kTaps - 1 - kDelay];
+        v[(size_t) kOver] = h[kTaps - kDelay];
         for (int p = 0; p < kOver - 1; ++p)
         {
             double acc = 0.0;
             const auto& c = phase[(size_t) p];
             for (int k = 0; k < kTaps; ++k) acc += c[(size_t) k] * h[kTaps - 1 - k];
-            peak = std::max (peak, std::abs (acc));
+            v[(size_t) p + 1] = acc;
+        }
+        int best = 0;
+        double peak = 0.0;
+        for (int i = 0; i <= kOver; ++i)
+            if (std::abs (v[(size_t) i]) > peak) { peak = std::abs (v[(size_t) i]); best = i; }
+        // Parabolic refinement: the true maximum usually falls between grid points.
+        if (best > 0 && best < kOver)
+        {
+            const double a = std::abs (v[(size_t) best - 1]), b = peak, c = std::abs (v[(size_t) best + 1]);
+            const double den = a - 2.0 * b + c;
+            if (den < 0.0)
+            {
+                const double d = 0.5 * (a - c) / den;
+                peak = std::max (peak, b - 0.25 * (a - c) * d);
+            }
         }
         if (++pos == (size_t) kTaps) pos = 0;
         return peak;
     }
 
 private:
-    std::array<std::array<double, kTaps>, kOver - 1> phase {};
-    std::array<double, kTaps * 2 + 1> hist {};
+    std::array<std::array<double, (size_t) kTaps>, (size_t) kOver - 1> phase {};
+    std::array<double, (size_t) kTaps * 2 + 1> hist {};
     size_t pos = 0;
 };
+
+using TruePeakDetector = TruePeakDetectorT<16, 48, 80>;
 } // namespace mb

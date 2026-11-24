@@ -1,6 +1,7 @@
 // Numerical tests for the Master Blaster DSP core. They don't need JUCE.
 #include "../Source/dsp/MasterChain.h"
 #include <cstdio>
+#include <complex>
 #include <ctime>
 #include <random>
 #include <string>
@@ -156,7 +157,7 @@ static void testLimiter()
         const double ceil = dbToGain (-1.0);
         check (samplePeak <= ceil + 1e-12, "limiter sample peak <= -1 dBFS (lookahead " + std::to_string (look) + " ms)", gainToDb (samplePeak));
         const double tp = gainToDb (std::max (truePeak16x (outL), truePeak16x (outR)));
-        check (tp < -1.0 + 0.2, "limiter true peak (independent 16x check) <= -0.8 dBTP", tp);
+        check (tp <= -1.0 + 0.01, "limiter true peak (independent 16x check) <= ceiling", tp);
     }
 
     // Latency: an impulse below the threshold must come out exactly at getLatency().
@@ -178,7 +179,7 @@ static void testChain()
     {
         MasterChain c;
         ChainParams p;
-        p.eqOn = false; p.stereoOn = false; p.mbOn = false; p.compOn = false; p.satOn = false; p.limOn = false;
+        p.eqOn = false; p.stereoOn = false; p.mbOn = false; p.dynOn = false; p.compOn = false; p.satOn = false; p.limOn = false;
         c.setParams (p); c.prepare (fs);
         const int lat = c.getLatencySamples();
         std::vector<double> inL (8192), inR (8192);
@@ -195,7 +196,7 @@ static void testChain()
     {
         MasterChain c;
         ChainParams p;
-        p.mbOn = true; p.satOn = true; p.satDriveDb = 6.0; p.satWarmth = 0.5;
+        p.mbOn = true; p.dynOn = true; p.satOn = true; p.satDriveDb = 6.0; p.satWarmth = 0.5; p.compAutoRelease = true; p.compAutoMakeup = true;
         p.limGainDb = 12.0;
         p.lowShelfDb = 2.0; p.highShelfDb = 1.5; p.width = 1.3;
         c.setParams (p); c.prepare (fs);
@@ -222,9 +223,179 @@ static void testChain()
         const double secs = double (std::clock() - t0) / CLOCKS_PER_SEC;
         check (finite, "full chain output finite", 1);
         check (peak <= dbToGain (-1.0) + 1e-12, "full chain sample peak <= ceiling (dBFS)", gainToDb (peak));
-        check (c.getMeters().truePeakMaxDb < -0.7, "full chain true peak (dBTP)", c.getMeters().truePeakMaxDb);
+        check (c.getMeters().truePeakMaxDb <= -1.0 + 0.01, "full chain true peak <= ceiling (dBTP)", c.getMeters().truePeakMaxDb);
         std::printf ("       full chain integrated loudness: %.2f LUFS\n", c.getMeters().integrated);
         check (secs < 10.0 * 0.25, "full chain CPU: realtime fraction (one core)", secs / 10.0);
+    }
+}
+
+
+static void testMatchedEq()
+{
+    // Digital response must track the analog prototype right up to 20 kHz at 44.1 kHz.
+    const double fs = 44100.0;
+    struct Case { MatchedBiquad::Type t; double fc, q, db; const char* name; };
+    const Case cases[] = { { MatchedBiquad::Type::highShelf, 12000, 0.7071, 6, "air shelf +6 dB @12k" },
+                           { MatchedBiquad::Type::highShelf, 16000, 0.7071, -6, "air shelf -6 dB @16k" },
+                           { MatchedBiquad::Type::bell, 10000, 4.0, -9, "bell -9 dB Q4 @10k" },
+                           { MatchedBiquad::Type::lowShelf, 90, 0.7071, 4, "low shelf +4 dB @90" },
+                           { MatchedBiquad::Type::bell, 300, 0.7, 3, "bell +3 dB @300" } };
+    for (const auto& c : cases)
+    {
+        MatchedBiquad b; b.setup (c.t, c.fc, c.q, c.db, fs);
+        const double A = std::pow (10.0, c.db / 40.0), sA = std::sqrt (A);
+        double worst = 0.0;
+        for (double f = 20.0; f < 20000.0; f *= 1.02)
+        {
+            const std::complex<double> s (0.0, f / c.fc);
+            std::complex<double> h;
+            if (c.t == MatchedBiquad::Type::bell) h = (s * s + s * (A / c.q) + 1.0) / (s * s + s / (A * c.q) + 1.0);
+            else if (c.t == MatchedBiquad::Type::lowShelf) h = A * (s * s + s * (sA / c.q) + A) / (A * s * s + s * (sA / c.q) + 1.0);
+            else h = A * (A * s * s + s * (sA / c.q) + 1.0) / (s * s + s * (sA / c.q) + A);
+            worst = std::max (worst, std::abs (b.magnitudeDb (f, fs) - 20.0 * std::log10 (std::abs (h))));
+        }
+        check (worst < 0.5, std::string ("matched EQ vs analog, ") + c.name + " (worst dB)", worst);
+    }
+}
+
+static void testTruePeakDetector()
+{
+    // Sum of 40 random sines up to 0.45 fs; compare against the exact continuous peak.
+    std::mt19937 rng (5);
+    std::uniform_real_distribution<double> u (0, 1);
+    double worst = 0.0;
+    for (int trial = 0; trial < 3; ++trial)
+    {
+        double f[40], ph[40];
+        for (int k = 0; k < 40; ++k) { f[k] = u (rng) * 0.45; ph[k] = u (rng) * 6.28; }
+        auto sig = [&] (double t) { double s = 0; for (int k = 0; k < 40; ++k) s += 0.1 * std::sin (2 * kPi * f[k] * t + ph[k]); return s; };
+        TruePeakDetector d;
+        std::vector<double> det;
+        for (int i = 0; i < 2000; ++i) det.push_back (d.process (sig (i)));
+        for (int n = 100; n < 1900; ++n)
+        {
+            double tp = 0;
+            for (int j = 0; j <= 128; ++j) tp = std::max (tp, std::abs (sig (n + j / 128.0)));
+            worst = std::max (worst, gainToDb (tp) - gainToDb (det[(size_t) (n + TruePeakDetector::kDelay)]));
+        }
+    }
+    check (worst < 0.06, "true-peak detector worst underestimate, content to 0.45 fs (dB)", worst);
+}
+
+// Runs a chain on a stereo generator and returns the output (after `skip` samples).
+template <typename Gen>
+static void runChain (MasterChain& c, Gen&& gen, int n, std::vector<double>& outL, std::vector<double>& outR, int skip = 0)
+{
+    std::vector<double> L (256), R (256);
+    for (int done = 0; done < n; done += 256)
+    {
+        for (int i = 0; i < 256; ++i) gen (done + i, L[(size_t) i], R[(size_t) i]);
+        c.process (L.data(), R.data(), 256);
+        for (int i = 0; i < 256; ++i)
+            if (done + i >= skip) { outL.push_back (L[(size_t) i]); outR.push_back (R[(size_t) i]); }
+    }
+}
+
+static ChainParams allOff()
+{
+    ChainParams p;
+    p.eqOn = false; p.stereoOn = false; p.mbOn = false; p.dynOn = false; p.compOn = false; p.satOn = false; p.limOn = false;
+    return p;
+}
+
+static double rmsDb (const std::vector<double>& x)
+{
+    double e = 0; for (double v : x) e += v * v;
+    return gainToDb (std::sqrt (e / std::max<size_t> (1, x.size())));
+}
+
+static void testDynamicEq()
+{
+    const double fs = 48000.0;
+    auto level = [&] (double freq, double ampDb)
+    {
+        MasterChain c; auto p = allOff();
+        p.dynOn = true; p.dynHz = { 3000.0, 3000.0 }; p.dynQ = { 2.0, 2.0 };
+        p.dynThreshDb = { -30.0, 0.0 }; p.dynRangeDb = { -6.0, 0.0 };
+        c.setParams (p); c.prepare (fs);
+        const double a = dbToGain (ampDb);
+        std::vector<double> L, R;
+        runChain (c, [&] (int i, double& l, double& r) { l = r = a * std::sin (2 * kPi * freq / fs * i); }, (int) fs, L, R, (int) fs / 2);
+        return rmsDb (L) - gainToDb (a / std::sqrt (2.0));
+    };
+    const double loud = level (3000.0, -6.0), quiet = level (3000.0, -50.0), offBand = level (300.0, -6.0);
+    check (loud < -5.0 && loud > -6.5, "dynamic EQ: loud in-band tone cut by ~range (dB)", loud);
+    check (std::abs (quiet) < 0.05, "dynamic EQ: quiet in-band tone untouched (dB)", quiet);
+    check (std::abs (offBand) < 0.3, "dynamic EQ: loud off-band tone barely touched (dB)", offBand);
+}
+
+static void testModesAndCompare()
+{
+    const double fs = 48000.0;
+    // Mono input through mid-only and side-only EQ and multiband must stay mono (L == R).
+    for (int mode : { 1, 2 })
+    {
+        MasterChain c; auto p = allOff();
+        p.eqOn = true; p.eqMode = mode; p.highShelfDb = 6.0; p.lowShelfDb = -3.0;
+        p.mbOn = true; p.mbMode = mode; p.bandThreshDb = { -30.0, -30.0, -30.0 }; p.bandRatio = { 3.0, 3.0, 3.0 };
+        c.setParams (p); c.prepare (fs);
+        std::mt19937 rng (2); std::normal_distribution<double> nd (0.0, 0.2);
+        std::vector<double> L, R;
+        runChain (c, [&] (int, double& l, double& r) { l = r = nd (rng); }, 48000, L, R);
+        double diff = 0; for (size_t i = 0; i < L.size(); ++i) diff = std::max (diff, std::abs (L[i] - R[i]));
+        check (diff < 1e-12, std::string ("mono input stays mono, ") + (mode == 1 ? "mid" : "side") + "-only EQ + multiband", diff);
+    }
+    // Side-only processing must leave a mono signal's level unchanged (it has no side).
+    {
+        MasterChain c; auto p = allOff();
+        p.eqOn = true; p.eqMode = 2; p.highShelfDb = 9.0;
+        c.setParams (p); c.prepare (fs);
+        std::vector<double> L, R;
+        runChain (c, [&] (int i, double& l, double& r) { l = r = 0.3 * std::sin (2 * kPi * 9000.0 / fs * i); }, 48000, L, R, 24000);
+        const double d = rmsDb (L) - gainToDb (0.3 / std::sqrt (2.0));
+        check (std::abs (d) < 0.01, "side-only air shelf leaves mono content untouched (dB)", d);
+    }
+    // Delta with every module off: once the level match settles, output ~ silence.
+    {
+        MasterChain c; auto p = allOff(); p.compare = 2;
+        c.setParams (p); c.prepare (fs);
+        std::mt19937 rng (4); std::normal_distribution<double> nd (0.0, 0.2);
+        std::vector<double> L, R;
+        runChain (c, [&] (int, double& l, double& r) { l = nd (rng); r = nd (rng); }, (int) fs * 12, L, R, (int) fs * 10);
+        check (rmsDb (L) < -100.0, "delta of a transparent chain is silent (dBFS RMS)", rmsDb (L));
+    }
+    // Level-matched bypass: the bypassed signal plays at the processed loudness.
+    {
+        auto loudness = [&] (int compare)
+        {
+            MasterChain c; ChainParams p; p.limGainDb = 8.0; p.compare = compare;
+            c.setParams (p); c.prepare (fs);
+            std::mt19937 rng (6); std::normal_distribution<double> nd (0.0, 0.1);
+            LoudnessMeter m; m.prepare (fs);
+            std::vector<double> L, R;
+            runChain (c, [&] (int i, double& l, double& r) { const double k = 0.5 * std::sin (2 * kPi * 60.0 / fs * i); l = nd (rng) + k; r = nd (rng) + k; },
+                      (int) fs * 14, L, R, (int) fs * 8);
+            for (size_t i = 0; i < L.size(); ++i) m.process (L[i], R[i]);
+            return m.getIntegrated();
+        };
+        const double processed = loudness (0), bypass = loudness (1);
+        check (std::abs (processed - bypass) < 0.5, "level-matched bypass within 0.5 LU of processed (LU diff)", processed - bypass);
+    }
+    // Auto makeup: glue compression with auto makeup keeps loudness close to the uncompressed level.
+    {
+        auto loudness = [&] (bool compOn)
+        {
+            MasterChain c; auto p = allOff(); p.compOn = compOn; p.compThreshDb = -30.0; p.compRatio = 3.0; p.compAutoMakeup = true;
+            c.setParams (p); c.prepare (fs);
+            std::mt19937 rng (8); std::normal_distribution<double> nd (0.0, 0.15);
+            LoudnessMeter m; m.prepare (fs);
+            std::vector<double> L, R;
+            runChain (c, [&] (int, double& l, double& r) { l = nd (rng); r = nd (rng); }, (int) fs * 16, L, R, (int) fs * 10);
+            for (size_t i = 0; i < L.size(); ++i) m.process (L[i], R[i]);
+            return m.getIntegrated();
+        };
+        const double d = loudness (true) - loudness (false);
+        check (std::abs (d) < 1.0, "glue auto makeup keeps loudness within 1 LU (LU diff)", d);
     }
 }
 
@@ -236,6 +407,10 @@ int main()
     testLoudness();
     testLimiter();
     testChain();
+    testMatchedEq();
+    testTruePeakDetector();
+    testDynamicEq();
+    testModesAndCompare();
     std::printf (failures ? "\n%d FAILURE(S)\n" : "\nALL TESTS PASSED\n", failures);
     return failures ? 1 : 0;
 }

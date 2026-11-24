@@ -7,32 +7,42 @@ A one-stop **mastering chain** for your master bus: VST3 and AU (plus a standalo
 ## Signal chain
 
 ```
-Input → EQ → Stereo → Multiband comp → Glue comp → Saturate (4x OS) → True-peak limiter → Dither
+Input → EQ → Stereo → Multiband → Dynamic EQ → Glue comp → Saturate (4x OS) → True-peak limiter → Compare → Dither
 ```
 
 | Stage | What it does | Technique |
 |---|---|---|
-| **Input / EQ** | input trim, 24 dB/oct low cut, low shelf, two bells, "Air" high shelf | Cytomic trapezoidal SVF, smoothed so automation is click-free |
+| **Input / EQ** | input trim, 24 dB/oct low cut, low shelf, two bells, "Air" shelf; **Stereo / Mid / Side** mode | Vicanek matched-response biquads: the analog curve holds right up to 20 kHz (no bilinear cramping) |
 | **Stereo** | width (M/S), mono bass below a chosen frequency | LR4 high-pass on the side channel, matching allpass on mid (phase-coherent) |
-| **Multiband** | 3-band compressor/leveller with per-band gain | LR4 crossovers that sum flat (zero latency), log-domain compressors |
-| **Glue Comp** | stereo-linked bus compressor with sidechain HPF and parallel mix | Giannoulis/Reiss soft-knee feed-forward design |
+| **Multiband** | 3-band compressor with per-band gain and GR meters; **Stereo / Mid / Side** mode | LR4 crossovers that sum flat (zero latency); in M or S mode the untouched channel gets the matching allpass |
+| **Dynamic EQ** | two bells that cut only while their band is loud (de-harsh, de-ess, tame boom) | constant-Q SVF band-pass, x + (g − 1)·BP(x): per-sample gain with no coefficient recalculation |
+| **Glue Comp** | stereo-linked bus compressor, sidechain HPF, parallel mix, **auto release**, **auto makeup** | Giannoulis/Reiss soft-knee feed-forward design; dual-envelope program-dependent release |
 | **Saturate** | tanh saturation with even-harmonic "Warmth" | 4x polyphase-IIR oversampling (>100 dB image rejection, a few samples of delay) |
-| **Limiter** | brickwall limiter, ceiling in dBTP, auto release, lookahead 0.5–5 ms | 8x true-peak detection; hold plus cascaded-box gain smoothing (no overshoot) |
+| **Limiter** | brickwall limiter, ceiling in dBTP, auto release, lookahead 0.5–5 ms | 16x true-peak detection with parabolic refinement (<0.05 dB error to 0.45 fs); hold plus cascaded-box gain smoothing |
+| **Compare** | **Bypass (matched)**: the dry input at the processed loudness. **Delta**: only what the processing changes | latency-aligned dry path, K-weighted 3 s loudness match |
 | **Dither** | 24-bit or 16-bit TPDF, optional noise shaping | the last stage in the chain |
 | **Meters** | momentary, short-term and integrated LUFS, true-peak max, GR per stage, correlation | ITU-R BS.1770-4 / EBU R128 |
+| **Analyzer** | long-term output spectrum (+3 dB/oct tilt), EQ curve, **reference-track overlay** (loudness-aligned) | 8192-point FFT, 1/6-octave smoothing |
+
+Workflow tools:
+* **Presets:** 11 factory starting points (Streaming −14, Apple −16, Loud EDM, Hip-Hop, Rock, Gentle Acoustic, Podcast −16, Broadcast −23, De-harsh, Wide & Bright…), plus saving your own. Factory presets also appear as host programs.
+* **A/B/C/D snapshots:** switch between whole settings instantly. They're saved with your session.
+* **Undo/Redo** for every change, including preset loads and Auto Match.
+* **Auto Match:** measures integrated loudness, adjusts the limiter drive, and repeats until the output is on target.
+* Tooltips on every control. Click a knob's value to type one ("3.5k" works). Double-click a knob to reset it. Switching a module off dims its controls.
 
 [`docs/RESEARCH.md`](docs/RESEARCH.md) explains the mastering practice and DSP research behind each choice.
 
 ## Quick workflow
 
-1. Put Master Blaster last on your master bus.
-2. Start with the defaults. EQ, stereo, glue and limiter are on with gentle settings; multiband and saturate are off.
-3. Make broad EQ moves (±1–2 dB). Keep mono bass at 100–150 Hz.
-4. Glue comp: aim for 1–3 dB of gain reduction on the loudest parts.
-5. Set **Target** (−14 LUFS for streaming), play the loudest section for about 10 s, then press **Match**. The limiter drive moves to close the gap. Press it again to refine, because a limiter doesn't add loudness dB-for-dB.
+1. Put Master Blaster last on your master bus and pick a preset close to your genre or destination.
+2. Make broad EQ moves (±1–2 dB). Use the analyzer's **reference overlay** to compare your tonal balance with a commercial track. Use **Mid/Side** mode for centre-only or sides-only moves.
+3. Glue comp: aim for 1–3 dB of gain reduction. **Auto Gain** keeps the level steady while you set it.
+4. Set **Target** (−14 LUFS for streaming), play a loud section and press **Auto Match**.
+5. Check your decisions with **Bypass (matched)** and **Delta**. Because the bypass plays at the same loudness, "louder sounds better" can't fool you.
 6. Keep the ceiling at **−1 dBTP** for streaming/lossy formats. Turn dither on only when rendering to 16-bit, and only if your DAW isn't already dithering.
 
-Every module's **ON** switch crossfades, so you can A/B while playing. With every module off, the plugin outputs a bit-exact, latency-compensated copy of its input.
+Every module's **ON** switch crossfades, so you can toggle while playing. With every module off, the plugin outputs a bit-exact, latency-compensated copy of its input.
 
 ## Building
 
@@ -65,7 +75,17 @@ xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/Components/"Master Blast
   * that the limiter latency matches what the plugin reports,
   * that the bypassed chain is bit-exact,
   * full-chain CPU use.
-* `tools/host_check` (`-DMB_BUILD_HOST_CHECK=ON`) loads the built VST3 the way a DAW does. It processes audio at several sample rates and irregular block sizes, round-trips the state, checks that the reported latency changes with the lookahead, and renders the UI.
+* The DSP suite also covers the newer features:
+  * the matched EQ against its analog prototype, up to 20 kHz,
+  * true-peak detector accuracy against an exact analytic signal,
+  * dynamic EQ behaviour (cuts loud in-band, leaves quiet and off-band material alone),
+  * mono input stays mono in Mid/Side modes,
+  * the delta of a transparent chain is silent,
+  * the level-matched bypass is within 0.5 LU of the processed output,
+  * auto makeup holds the loudness.
+* `tools/host_check` (`-DMB_BUILD_HOST_CHECK=ON`) builds two tools:
+  * `mb_host_check` loads the built VST3 the way a DAW does. It processes audio at several sample rates and irregular block sizes, round-trips the state, and checks that the reported latency changes with the lookahead.
+  * `mb_ui_snapshot` checks presets, snapshots, undo, user preset save/load, state restore and reference-track analysis, then renders the UI.
 
 ## Layout
 

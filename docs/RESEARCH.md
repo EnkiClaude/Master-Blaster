@@ -16,6 +16,23 @@ A typical modern mastering chain runs: **corrective EQ → tonal/broad EQ → dy
 * The low cut is a 4th-order Butterworth (24 dB/oct, Q = 0.541 / 1.307) at about 25 Hz. It removes sub-sonic energy that eats limiter headroom without adding anything audible.
 * All parameters are smoothed. The coefficients update every 32 samples, which the SVF tolerates without zipper noise.
 
+### Matched-response EQ (v1.1)
+
+A bilinear-transform filter (the SVF included) maps the analog frequency axis onto 0…fs/2 with a tan() warp. Near Nyquist, bands and shelves get squeezed: an air shelf at 12–16 kHz at 44.1 kHz misses its analog curve by 1–4 dB. The four EQ bands now use **Vicanek's matched second-order design** (2016):
+
+* poles by impulse invariance,
+* the numerator solved so |H| equals the analog |H| at DC, at Nyquist and at the centre frequency.
+
+Measured worst-case error from 20 Hz to 20 kHz is 0.3–0.4 dB, against 1–3.9 dB for the bilinear design. There is no oversampling and no latency. The low cut stays an SVF, because cramping doesn't affect it.
+
+### Mid/Side processing
+
+The EQ and multiband can work on L/R, on Mid only, or on Side only. In Mid or Side mode of the multiband, the untouched channel goes through the same allpass pair as the band sum (AP(f_lo)·AP(f_hi)), so M and S stay phase-coherent and the stereo image doesn't smear around the crossovers.
+
+### Dynamic EQ
+
+Each band computes y = x + (g − 1)·BP(x), where BP is a unity-peak, constant-Q state-variable band-pass. The detector uses the same band-pass output, so the band reacts only to what it treats. The gain g can change every sample with no coefficient recalculation, so there is no zipper noise and no latency.
+
 ## 3. Crossovers — Linkwitz-Riley 4th order
 
 * LR4 low and high outputs add up to an allpass: flat magnitude, phase-coherent, **zero latency**. A linear-phase FIR crossover would add 20–80 ms of latency and pre-ringing, so this is the better choice for a low-latency master bus.
@@ -30,7 +47,11 @@ The paper compares compressor topologies and recommends:
 * the level detector placed **after** the gain computer (it smooths the gain-reduction signal),
 * a **smooth branching peak detector** (separate attack and release one-poles, with no release drift).
 
-Both of Master Blaster's compressors follow that design. The glue compressor also uses:
+Both of Master Blaster's compressors follow that design. The glue compressor also has:
+
+* **Auto release:** two detectors run in parallel and the larger gain reduction wins. A fast one (release ÷ 3) catches transients; a slow one (attack × 15, release × 4) tracks sustained level. After a drum hit the gain recovers quickly, while dense passages settle into steady reduction instead of pumping.
+* **Auto makeup:** adds back a 2.5 s average of the gain reduction, so you can set the compression by ear without the level changing.
+* The same design as the multiband for everything else:
 
 * a short RMS pre-average (5 ms) so it responds to energy rather than single peaks,
 * a **sidechain high-pass** (90 Hz by default) so the kick and bass don't pump the whole mix,
@@ -47,7 +68,7 @@ Both of Master Blaster's compressors follow that design. The glue compressor als
 ## 6. True-peak limiting
 
 * **ITU-R BS.1770-4 Annex 2** defines true peak as the peak of the signal oversampled at least 4x. Streaming encoders (AAC/Opus/MP3) can add further overshoot, so a −1 dBTP ceiling is the usual recommendation (Spotify, Apple Music/"Apple Digital Masters", AES TD1004).
-* Master Blaster detects peaks with an **8x, 32-tap-per-phase** windowed-sinc interpolator on the sidechain only. Measured worst-case underestimate: about 0.17 dB for content up to 0.4 fs, about 0.36 dB up to 0.45 fs.
+* Master Blaster detects peaks with a **16x, 48-tap-per-phase** windowed-sinc interpolator on the sidechain only. A **parabolic fit** through the highest interpolated point and its neighbours estimates the peak between grid points. Measured worst-case underestimate is under 0.05 dB for content up to 0.45 fs (19.8 kHz at 44.1 kHz). The detector adds a +0.06 dB margin, so in the tests the output stays under the ceiling. Above 0.45 fs (the last ~2 kHz before Nyquist) the error grows quickly; real masters have very little energy there.
 * Gain path (the construction from Signalsmith Audio's limiter write-up):
   1. required gain = ceiling / peak,
   2. instant attack, program-dependent exponential release,
@@ -57,6 +78,16 @@ Both of Master Blaster's compressors follow that design. The glue compressor als
   The boxes give a smooth S-curve attack. Because the hold covers the averaging window, the gain is guaranteed to have reached its target by the time the delayed sample arrives, so there is no sample-peak overshoot. Both box filters rebuild their sums exactly, so floating-point error cannot drift.
 * **Auto release** lengthens the release time while the average gain reduction stays high. Transients recover fast; dense passages recover slowly, which avoids pumping and low-frequency distortion.
 * The lookahead (0.5–5 ms) is the main latency cost. At the 2 ms default the whole plugin has about 2.5 ms of latency.
+
+## 6b. Honest A/B: level-matched bypass and delta
+
+Listeners reliably prefer the louder of two versions, so an unmatched bypass mostly tells you "the limiter made it louder". The compare stage:
+
+* delays the dry input by the plugin's latency,
+* measures both the dry input and the output with **K-weighted, 3-second energy averages**, the same weighting as LUFS,
+* scales the dry signal to the output's loudness.
+
+**Bypass (matched)** plays that scaled dry signal. **Delta** plays *processed − matched dry*: only what the chain changes in tone and dynamics. A transparent chain's delta tests as silent (below −100 dBFS).
 
 ## 7. Loudness targets
 
@@ -73,7 +104,11 @@ The meter follows BS.1770-4 / EBU Tech 3341:
 * momentary (400 ms) and short-term (3 s) windows,
 * **gated integrated** loudness: −70 LUFS absolute gate, −10 LU relative gate, 75 %-overlapped blocks.
 
-The tests check a 997 Hz sine against the spec's reference values. The **Match** button moves the limiter drive by (target − integrated).
+The tests check a 997 Hz sine against the spec's reference values. **Auto Match** works in passes:
+
+1. Measure the integrated loudness for 6 s.
+2. Move the limiter drive by the error, overshooting slightly on later passes because a hard-working limiter gives back less than dB-for-dB.
+3. Repeat until within 0.3 LU, or after 5 passes.
 
 ## 8. Dither
 
@@ -94,4 +129,5 @@ When the master is rendered to 16-bit, the plugin applies TPDF dither, optionall
 * L. de Soras, *hiir* polyphase IIR half-band library; O. Niemitalo, polyphase IIR half-band design notes
 * S. Linkwitz / R. Riley, active crossover alignments (LR4)
 * Signalsmith Audio, "Designing a limiter" (hold + cascaded box-filter gain smoothing)
+* M. Vicanek, "Matched Second Order Digital Filters", 2016
 * AES TD1004.1.15-10, *Recommendation for Loudness of Audio Streaming and Network File Playback*

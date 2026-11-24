@@ -1,6 +1,7 @@
 #pragma once
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "dsp/MasterChain.h"
+#include <map>
 
 namespace mbp
 {
@@ -9,6 +10,7 @@ using APVTS = juce::AudioProcessorValueTreeState;
 inline const juce::StringArray lookaheadChoices { "0.5 ms", "1 ms", "2 ms", "3 ms", "5 ms" };
 inline constexpr double lookaheadMs[] { 0.5, 1.0, 2.0, 3.0, 5.0 };
 inline const juce::StringArray ditherChoices { "Off", "24-bit TPDF", "16-bit TPDF", "16-bit shaped" };
+inline const juce::StringArray msChoices { "Stereo", "Mid", "Side" };
 
 inline juce::NormalisableRange<float> freqRange (float lo, float hi)
 {
@@ -41,6 +43,15 @@ inline std::function<juce::String (float, int)> formatter (const juce::String& u
     return [unit] (float x, int) { return String (x, unit == "dB" ? 1 : 1) + " " + unit; };
 }
 
+// Text typed into a knob's value box: accepts "3.5k", "3.5 kHz", "-1.5 dB", "40%".
+inline float parseValue (const juce::String& text)
+{
+    const auto t = text.trim().toLowerCase();
+    float v = t.getFloatValue();
+    if (t.containsChar ('k')) v *= 1000.0f;
+    return v;
+}
+
 inline APVTS::ParameterLayout createLayout()
 {
     using namespace juce;
@@ -51,11 +62,12 @@ inline APVTS::ParameterLayout createLayout()
         layout.add (std::make_unique<AudioParameterFloat> (ParameterID { id, v }, name, range, def,
                                                              AudioParameterFloatAttributes()
                                                                  .withLabel (unit)
-                                                                 .withStringFromValueFunction (formatter (unit))));
+                                                                 .withStringFromValueFunction (formatter (unit))
+                                                                 .withValueFromStringFunction ([] (const String& t) { return parseValue (t); })));
     };
-    auto bo = [&] (const char* id, const char* name, bool def)
+    auto bo = [&] (const String& id, const String& name, bool def)
     { layout.add (std::make_unique<AudioParameterBool> (ParameterID { id, v }, name, def)); };
-    auto ch = [&] (const char* id, const char* name, const StringArray& c, int def)
+    auto ch = [&] (const String& id, const String& name, const StringArray& c, int def)
     { layout.add (std::make_unique<AudioParameterChoice> (ParameterID { id, v }, name, c, def)); };
 
     fl ("inGain", "Input Gain", { -24.0f, 24.0f, 0.01f }, 0.0f, "dB");
@@ -73,6 +85,7 @@ inline APVTS::ParameterLayout createLayout()
     fl ("highMidQ", "High Mid Q", skewed (0.2f, 6.0f, 1.0f), 0.7f, "");
     fl ("highShelfHz", "High Shelf Freq", freqRange (2000.0f, 20000.0f), 12000.0f, "Hz");
     fl ("highShelfDb", "High Shelf Gain", { -12.0f, 12.0f, 0.01f }, 0.0f, "dB");
+    ch ("eqMode", "EQ Mode", msChoices, 0);
 
     bo ("stereoOn", "Stereo On", true);
     fl ("width", "Stereo Width", { 0.0f, 200.0f, 0.1f }, 100.0f, "%");
@@ -93,6 +106,20 @@ inline APVTS::ParameterLayout createLayout()
     }
     fl ("mbAttack", "MB Attack", skewed (0.5f, 200.0f, 20.0f), 20.0f, "ms");
     fl ("mbRelease", "MB Release", skewed (10.0f, 2000.0f, 200.0f), 160.0f, "ms");
+    ch ("mbMode", "MB Mode", msChoices, 0);
+
+    bo ("dynOn", "Dynamic EQ On", false);
+    const float dynHzDef[] { 250.0f, 3200.0f }, dynQDef[] { 1.5f, 2.0f };
+    for (int b = 0; b < 2; ++b)
+    {
+        const String n ("Dyn " + String (b + 1) + " ");
+        fl ("dyn" + String (b) + "Hz", n + "Freq", freqRange (40.0f, 16000.0f), dynHzDef[b], "Hz");
+        fl ("dyn" + String (b) + "Q", n + "Q", skewed (0.3f, 8.0f, 1.5f), dynQDef[b], "");
+        fl ("dyn" + String (b) + "Thresh", n + "Threshold", { -60.0f, 0.0f, 0.01f }, -24.0f, "dB");
+        fl ("dyn" + String (b) + "Range", n + "Range", { -18.0f, 0.0f, 0.01f }, -4.0f, "dB");
+    }
+    fl ("dynAttack", "Dyn Attack", skewed (0.1f, 100.0f, 5.0f), 5.0f, "ms");
+    fl ("dynRelease", "Dyn Release", skewed (10.0f, 1000.0f, 120.0f), 120.0f, "ms");
 
     bo ("compOn", "Glue On", true);
     fl ("compThresh", "Glue Threshold", { -48.0f, 0.0f, 0.01f }, -18.0f, "dB");
@@ -103,6 +130,8 @@ inline APVTS::ParameterLayout createLayout()
     fl ("compMakeup", "Glue Makeup", { -12.0f, 12.0f, 0.01f }, 0.0f, "dB");
     fl ("compMix", "Glue Mix", { 0.0f, 100.0f, 0.1f }, 100.0f, "%");
     fl ("compScHpf", "Glue SC HPF", freqRange (10.0f, 400.0f), 90.0f, "Hz");
+    bo ("compAutoRel", "Glue Auto Release", false);
+    bo ("compAutoMakeup", "Glue Auto Makeup", false);
 
     bo ("satOn", "Saturate On", false);
     fl ("satDrive", "Saturate Drive", { 0.0f, 18.0f, 0.01f }, 3.0f, "dB");
@@ -141,7 +170,16 @@ public:
         lowShelfHz = r ("lowShelfHz"); lowShelfDb = r ("lowShelfDb");
         lowMidHz = r ("lowMidHz"); lowMidDb = r ("lowMidDb"); lowMidQ = r ("lowMidQ");
         highMidHz = r ("highMidHz"); highMidDb = r ("highMidDb"); highMidQ = r ("highMidQ");
-        highShelfHz = r ("highShelfHz"); highShelfDb = r ("highShelfDb");
+        highShelfHz = r ("highShelfHz"); highShelfDb = r ("highShelfDb"); eqMode = r ("eqMode");
+        mbMode = r ("mbMode"); dynOn = r ("dynOn"); dynAttack = r ("dynAttack"); dynRelease = r ("dynRelease");
+        for (int b = 0; b < 2; ++b)
+        {
+            dynHz[(size_t) b] = r ("dyn" + juce::String (b) + "Hz");
+            dynQ[(size_t) b] = r ("dyn" + juce::String (b) + "Q");
+            dynThresh[(size_t) b] = r ("dyn" + juce::String (b) + "Thresh");
+            dynRange[(size_t) b] = r ("dyn" + juce::String (b) + "Range");
+        }
+        compAutoRel = r ("compAutoRel"); compAutoMakeup = r ("compAutoMakeup");
         stereoOn = r ("stereoOn"); width = r ("width"); monoBassOn = r ("monoBassOn"); monoBassHz = r ("monoBassHz");
         mbOn = r ("mbOn"); xoverLow = r ("xoverLow"); xoverHigh = r ("xoverHigh");
         for (int b = 0; b < 3; ++b)
@@ -169,6 +207,15 @@ public:
         p.lowMidHz = g (lowMidHz); p.lowMidDb = g (lowMidDb); p.lowMidQ = g (lowMidQ);
         p.highMidHz = g (highMidHz); p.highMidDb = g (highMidDb); p.highMidQ = g (highMidQ);
         p.highShelfHz = g (highShelfHz); p.highShelfDb = g (highShelfDb);
+        p.eqMode = juce::jlimit (0, 2, (int) std::lround (g (eqMode)));
+        p.mbMode = juce::jlimit (0, 2, (int) std::lround (g (mbMode)));
+        p.dynOn = b (dynOn); p.dynAttackMs = g (dynAttack); p.dynReleaseMs = g (dynRelease);
+        for (size_t i = 0; i < 2; ++i)
+        {
+            p.dynHz[i] = g (dynHz[i]); p.dynQ[i] = g (dynQ[i]);
+            p.dynThreshDb[i] = g (dynThresh[i]); p.dynRangeDb[i] = g (dynRange[i]);
+        }
+        p.compAutoRelease = b (compAutoRel); p.compAutoMakeup = b (compAutoMakeup);
         p.stereoOn = b (stereoOn); p.width = g (width) * 0.01; p.monoBassOn = b (monoBassOn); p.monoBassHz = g (monoBassHz);
         p.mbOn = b (mbOn); p.xoverLowHz = g (xoverLow); p.xoverHighHz = g (xoverHigh);
         for (size_t i = 0; i < 3; ++i)
@@ -195,5 +242,64 @@ private:
       compOn, compThresh, compRatio, compAttack, compRelease, compKnee, compMakeup, compMix, compScHpf, satOn, satDrive,
       satWarmth, satMix, limOn, limGain, limCeiling, limRelease, lookahead, autoRelease, truePeak, dither;
     std::array<P, 3> bandThresh {}, bandRatio {}, bandGain {};
+    P eqMode, mbMode, dynOn, dynAttack, dynRelease, compAutoRel, compAutoMakeup;
+    std::array<P, 2> dynHz {}, dynQ {}, dynThresh {}, dynRange {};
 };
+// Tooltip text for every control.
+inline juce::String tooltipFor (const juce::String& id)
+{
+    static const std::map<juce::String, juce::String> tips {
+        { "inGain", "Input trim before all processing." },
+        { "eqOn", "EQ on/off (click-free crossfade)." },
+        { "lowCutOn", "24 dB/oct low cut that removes sub-sonic rumble eating limiter headroom." },
+        { "lowCutHz", "Low cut corner frequency. 20-30 Hz is typical for music." },
+        { "lowShelfHz", "Low shelf corner frequency." }, { "lowShelfDb", "Low shelf gain. Keep moves small (+/-1-2 dB)." },
+        { "lowMidHz", "Low-mid bell frequency (mud lives around 200-400 Hz)." }, { "lowMidDb", "Low-mid bell gain." },
+        { "lowMidQ", "Low-mid bell width. Lower Q = broader." },
+        { "highMidHz", "High-mid bell frequency (presence 2-5 kHz)." }, { "highMidDb", "High-mid bell gain." },
+        { "highMidQ", "High-mid bell width." },
+        { "highShelfHz", "Air shelf corner frequency." }, { "highShelfDb", "Air shelf gain. Matched-response design: accurate right up to 20 kHz." },
+        { "eqMode", "Apply the four EQ bands to both channels (Stereo), the centre only (Mid) or the sides only (Side). The low cut is always stereo." },
+        { "stereoOn", "Stereo section on/off." }, { "width", "Side-channel level. 100 % = unchanged, 0 % = mono." },
+        { "monoBassOn", "Make everything below the Mono Below frequency mono (phase-coherent LR4 split)." },
+        { "monoBassHz", "Below this frequency the signal is made mono." },
+        { "mbOn", "Three-band compressor on/off." }, { "mbMode", "Compress both channels linked (Stereo), only the centre (Mid) or only the sides (Side)." },
+        { "xoverLow", "Low/mid crossover frequency." }, { "xoverHigh", "Mid/high crossover frequency." },
+        { "mbAttack", "Multiband attack time." }, { "mbRelease", "Multiband release time." },
+        { "dynOn", "Dynamic EQ on/off: bells that cut only while their band gets loud." },
+        { "dynAttack", "How fast the dynamic bands react." }, { "dynRelease", "How fast the dynamic bands let go." },
+        { "compOn", "Glue compressor on/off." }, { "compThresh", "Level where compression starts. Aim for 1-3 dB of gain reduction." },
+        { "compRatio", "Compression ratio. 1.5-2:1 is typical glue." }, { "compAttack", "Attack. Slower (30 ms+) lets transients through." },
+        { "compRelease", "Release. With Auto Release on this is the base time." }, { "compKnee", "Soft-knee width." },
+        { "compMakeup", "Manual makeup gain." }, { "compMix", "Parallel mix of compressed and dry signal." },
+        { "compScHpf", "Sidechain high-pass: stops the kick and bass from pumping the whole mix." },
+        { "compAutoRel", "Program-dependent release: fast after transients, slow on sustained material." },
+        { "compAutoMakeup", "Adds back the average gain reduction so loudness stays the same while you compress." },
+        { "satOn", "Saturation on/off." }, { "satDrive", "Saturation drive (output auto-compensated)." },
+        { "satWarmth", "Adds even harmonics (asymmetric curve)." }, { "satMix", "Parallel saturation mix." },
+        { "limOn", "Limiter on/off." }, { "limGain", "Drives the mix into the limiter. This is your loudness control." },
+        { "limCeiling", "Maximum true-peak output level. -1 dBTP is the streaming recommendation." },
+        { "limRelease", "Limiter release (base time when Auto Release is on)." },
+        { "lookahead", "Limiter lookahead. Longer is smoother on transients but adds latency." },
+        { "autoRelease", "Program-dependent limiter release." },
+        { "truePeak", "Detect inter-sample (true) peaks with 16x interpolation." },
+        { "dither", "Only when rendering to 16-bit (or 24-bit fixed point) and your DAW doesn't dither." },
+        { "targetLufs", "Integrated loudness target for Auto Match. Streaming: -14, Apple: -16, broadcast: -23." },
+    };
+    if (auto it = tips.find (id); it != tips.end()) return it->second;
+    if (id.startsWith ("band"))
+    {
+        if (id.endsWith ("Thresh")) return "Band threshold.";
+        if (id.endsWith ("Ratio")) return "Band ratio.";
+        if (id.endsWith ("Gain")) return "Band output gain (also works as a broad tone control).";
+    }
+    if (id.startsWith ("dyn"))
+    {
+        if (id.endsWith ("Hz")) return "Dynamic band centre frequency.";
+        if (id.endsWith ("Q")) return "Dynamic band width.";
+        if (id.endsWith ("Thresh")) return "The band starts cutting when its level passes this threshold.";
+        if (id.endsWith ("Range")) return "The most this band may cut.";
+    }
+    return {};
+}
 } // namespace mbp
