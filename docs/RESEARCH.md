@@ -89,6 +89,17 @@ Listeners reliably prefer the louder of two versions, so an unmatched bypass mos
 
 **Bypass (matched)** plays that scaled dry signal. **Delta** plays *processed − matched dry*: only what the chain changes in tone and dynamics. A transparent chain's delta tests as silent (below −100 dBFS).
 
+## 6c. Clip, then limit
+
+Modern loud masters often put a clipper before the limiter. A clipper reshapes only the few samples above its threshold and has no attack or release, so it can't pump. The limiter then catches what remains, with less gain reduction and so less audible modulation.
+
+Master Blaster's clipper:
+* sits after the Drive gain, with its threshold relative to the limiter ceiling,
+* uses a tanh knee (continuous slope at the knee point) whose width is the Softness control,
+* runs 4x oversampled with the same low-latency IIR half-bands as the saturator, which keeps the harmonics it creates from aliasing.
+
+The limiter after it still guarantees the true-peak ceiling. In the test suite (noise plus a kick, +12 dB drive), enabling the clipper at the ceiling with 50% softness drops the limiter's average gain reduction from 6.6 dB to 4.5 dB.
+
 ## 7. Loudness targets
 
 | Destination | Typical integrated target | Peak |
@@ -110,6 +121,12 @@ The tests check a 997 Hz sine against the spec's reference values. **Auto Match*
 2. Move the limiter drive by the error, overshooting slightly on later passes because a hard-working limiter gives back less than dB-for-dB.
 3. Repeat until within 0.3 LU, or after 5 passes.
 
+### Loudness range and PLR
+
+* **LRA** (EBU Tech 3342) takes the 3 s short-term values every 100 ms. It drops those below −70 LUFS, then those more than 20 LU below their power average, and reports the spread between the 10th and 95th percentiles. Test signals from Tech 3342 (two 20 s tones 10, 5 and 20 dB apart) measure exactly 10, 5 and 20 LU.
+* **PLR** = true-peak max − integrated loudness: a quick indicator of how hard the master has been squashed. Below about 8 dB is very dense.
+* The **history graph** shows the last 60 s of short-term and momentary loudness against the target.
+
 ## 8. Dither
 
 When the master is rendered to 16-bit, the plugin applies TPDF dither, optionally with first-order noise shaping (the error spectrum gets a (1 − z⁻¹) shape). Dither must be the **last** process. Leave it off if your DAW dithers on export, or if you render 24-bit or float.
@@ -117,7 +134,8 @@ When the master is rendered to 16-bit, the plugin applies TPDF dither, optionall
 ## 9. Precision & hygiene
 
 * The whole chain runs in **64-bit floating point**. The plugin also accepts 64-bit buffers from hosts that offer them.
-* Each module runs continuously and is crossfaded by its on/off switch, so toggling is click-free and filter states stay warm. A fully bypassed chain is a **bit-exact** delayed copy of the input (tested).
+* Each module is crossfaded by its on/off switch, so toggling is click-free. A module that is fully off is skipped, and its state is cleared when it comes back; the 20 ms fade-in covers the restart. A stress test that toggles modules and modes at random checks the output stays finite and under the ceiling.
+* The true-peak detectors keep their 15 phase sums in SIMD registers (GCC/Clang vector extensions, SSE intrinsics on MSVC), about 4x faster than the scalar version. They also skip interpolation when the window's maximum times the filter's L1 norm can't reach the level of interest: the limiter's ceiling, or the meter's current max-hold. A fully bypassed chain is a **bit-exact** delayed copy of the input (tested).
 * The audio thread never allocates. Every parameter pointer is cached once.
 
 ## References

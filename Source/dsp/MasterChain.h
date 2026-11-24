@@ -4,7 +4,8 @@
 //
 //  in gain -> EQ (low cut + 4 matched bands; stereo / mid / side) -> stereo (width, mono bass)
 //  -> 3-band compressor (stereo / mid / side) -> 2-band dynamic EQ -> glue compressor
-//  -> saturator (4x oversampled) -> true-peak limiter -> compare (level-matched bypass / delta)
+//  -> saturator (4x oversampled) -> drive -> soft clipper (4x oversampled) -> true-peak limiter
+//  -> compare (level-matched bypass / delta) -> monitor (mono / side) -> dither
 //  -> dither
 //
 // Everything runs in double precision.
@@ -53,23 +54,29 @@ struct ChainParams
     bool satOn = false;
     double satDriveDb = 3.0, satWarmth = 0.0, satMix = 1.0;
 
+    bool clipOn = false;
+    double clipLevelDb = 0.0;  // clip threshold relative to the limiter ceiling
+    double clipSoftness = 0.5; // 0 = hard clip, 1 = widest knee
+
     bool limOn = true;
     double limGainDb = 0.0, limCeilingDb = -1.0, limReleaseMs = 80.0, lookaheadMs = 2.0;
     bool autoRelease = true, truePeak = true;
 
     int dither = 0; // Dither::Mode
     int compare = 0; // 0 processed, 1 level-matched bypass, 2 delta (processed minus level-matched dry)
+    int monitor = 0; // 0 stereo, 1 mono (L+R)/2, 2 side only (L-R)/2 on both speakers
 };
 
 struct ChainMeters
 {
     double inPeakDb = -150.0, outPeakDb = -150.0, truePeakMaxDb = -150.0;
-    double compGrDb = 0.0, limGrDb = 0.0;
+    double compGrDb = 0.0, limGrDb = 0.0, clipDb = 0.0;
     std::array<double, 3> bandGrDb {};
     std::array<double, 2> dynGrDb {};
     double autoMakeupDb = 0.0, matchGainDb = 0.0;
-    double momentary = -150.0, shortTerm = -150.0, integrated = -150.0;
+    double momentary = -150.0, shortTerm = -150.0, integrated = -150.0, loudnessRange = 0.0;
     double correlation = 1.0;
+    long long loudnessBlocks = 0; // 100 ms sub-blocks measured so far (for the history graph)
 };
 
 class MasterChain
@@ -92,8 +99,9 @@ public:
         currentLookahead = params.lookaheadMs;
         loud.prepare (sr);
         for (auto& d : satBypassDelay) { d.prepare (satLatency + 1); d.setDelay (satLatency); }
+        for (auto& d : clipBypassDelay) { d.prepare (satLatency + 1); d.setDelay (satLatency); }
         for (auto& d : dc) d.setup (2.0, sr);
-        const int maxLatency = satLatency + TruePeakDetector::kDelay + (int) std::ceil (kMaxLookaheadMs * 0.001 * sr) + 4;
+        const int maxLatency = 2 * satLatency + TruePeakDetector::kDelay + (int) std::ceil (kMaxLookaheadMs * 0.001 * sr) + 4;
         for (auto& d : dryDelay) { d.prepare (maxLatency); d.setDelay (getLatencySamples()); }
         setupKWeighting (sr);
         autoMakeupCoef = msToCoef (2500.0, sr);
@@ -119,6 +127,8 @@ public:
         for (auto& f : scHpf) f.reset();
         for (auto& o : os) o.reset();
         for (auto& d : satBypassDelay) d.reset();
+        for (auto& d : clipBypassDelay) d.reset();
+        for (auto& o : clipOs) o.reset();
         for (auto& d : dc) d.reset();
         for (auto& d : dryDelay) d.reset();
         for (auto& k : kw) k.reset();
@@ -135,7 +145,8 @@ public:
     void setParams (const ChainParams& p) noexcept { params = p; }
     const ChainParams& getParams() const noexcept { return params; }
 
-    int getLatencySamples() const noexcept { return satLatency + limiter.getLatency(); }
+    // Saturator and clipper each add the oversampler's (small) delay, then the limiter's lookahead.
+    int getLatencySamples() const noexcept { return 2 * satLatency + limiter.getLatency(); }
 
     // Returns true when the latency changed (new lookahead), so the host must be told.
     bool applyLookaheadIfChanged()
@@ -155,6 +166,9 @@ public:
     void process (double* L, double* R, int n) noexcept
     {
         double inPeak = 0.0, outPeak = 0.0;
+        // The output true-peak meter is a max-hold, so it only needs to resolve peaks above the current maximum.
+        const double tpHold = meters.truePeakMaxDb > -140.0 ? dbToGain (meters.truePeakMaxDb) * 0.999 : 0.0;
+        outTp[0].setSkipBelow (tpHold); outTp[1].setSkipBelow (tpHold);
         for (int start = 0; start < n; start += kChunk)
         {
             const int len = std::min (kChunk, n - start);
@@ -172,6 +186,8 @@ public:
         meters.outPeakDb = gainToDb (outPeak);
         meters.compGrDb = glue.getReductionDb() * v (kWetComp);
         meters.limGrDb = limiter.getReductionDb();
+        meters.clipDb = act.clip ? gainToDb (clipRedMax, -100.0) * v (kWetClip) : 0.0;
+        clipRedMax = 1.0;
         for (size_t b = 0; b < 3; ++b)
             meters.bandGrDb[b] = v (kWetMb) * (v (kMbSt) * bandComp[0][b].getReductionDb() + v (kMbMid) * bandComp[1][b].getReductionDb()
                                               + v (kMbSide) * bandComp[2][b].getReductionDb());
@@ -181,6 +197,8 @@ public:
         meters.momentary = loud.getMomentary();
         meters.shortTerm = loud.getShortTerm();
         meters.integrated = loud.getIntegrated();
+        meters.loudnessRange = loud.getLoudnessRange();
+        meters.loudnessBlocks = loud.getSubBlockCount();
         meters.correlation = corrXY / std::sqrt (corrXX * corrYY);
     }
 
@@ -190,9 +208,9 @@ private:
     {
         kInGain, kLsHz, kLsDb, kLmHz, kLmDb, kLmQ, kHmHz, kHmDb, kHmQ, kHsHz, kHsDb, kLcHz,
         kWidth, kMonoHz, kXlo, kXhi, kBg0, kBg1, kBg2, kMakeup, kCompMix, kSatDrive, kSatWarm, kSatMix,
-        kLimGain, kDyn0Hz, kDyn1Hz, kDyn0Q, kDyn1Q,
+        kLimGain, kDyn0Hz, kDyn1Hz, kDyn0Q, kDyn1Q, kClipLevel, kClipSoft, kWetClip,
         kWetEq, kWetLowCut, kWetStereo, kWetMono, kWetMb, kWetDyn, kWetComp, kWetSat, kWetAutoMakeup,
-        kEqSt, kEqMid, kEqSide, kMbSt, kMbMid, kMbSide, kCmpOff, kCmpByp, kCmpDelta, kNumSmooth
+        kEqSt, kEqMid, kEqSide, kMbSt, kMbMid, kMbSide, kCmpOff, kCmpByp, kCmpDelta, kMonSt, kMonMono, kMonSide, kNumSmooth
     };
 
     inline double v (int i) const noexcept { return smooth[(size_t) i].value(); }
@@ -209,12 +227,14 @@ private:
             dbToGain (p.bandGainDb[0]), dbToGain (p.bandGainDb[1]), dbToGain (p.bandGainDb[2]),
             dbToGain (p.compMakeupDb), p.compMix, dbToGain (p.satDriveDb), p.satWarmth, p.satMix,
             dbToGain (p.limGainDb), std::log (p.dynHz[0]), std::log (p.dynHz[1]), p.dynQ[0], p.dynQ[1],
+            dbToGain (p.limCeilingDb + p.clipLevelDb), p.clipSoftness, p.clipOn ? 1.0 : 0.0,
             p.eqOn ? 1.0 : 0.0, (p.eqOn && p.lowCutOn) ? 1.0 : 0.0, p.stereoOn ? 1.0 : 0.0,
             (p.stereoOn && p.monoBassOn) ? 1.0 : 0.0, p.mbOn ? 1.0 : 0.0, p.dynOn ? 1.0 : 0.0, p.compOn ? 1.0 : 0.0,
             p.satOn ? 1.0 : 0.0, (p.compOn && p.compAutoMakeup) ? 1.0 : 0.0,
             oneHot (p.eqMode, 0), oneHot (p.eqMode, 1), oneHot (p.eqMode, 2),
             oneHot (p.mbMode, 0), oneHot (p.mbMode, 1), oneHot (p.mbMode, 2),
-            oneHot (p.compare, 0), oneHot (p.compare, 1), oneHot (p.compare, 2)
+            oneHot (p.compare, 0), oneHot (p.compare, 1), oneHot (p.compare, 2),
+            oneHot (p.monitor, 0), oneHot (p.monitor, 1), oneHot (p.monitor, 2)
         };
         bool anyChange = snap;
         for (int i = 0; i < kNumSmooth; ++i)
@@ -230,6 +250,7 @@ private:
             }
         }
         setDynamicsParams();
+        updateActivity (snap);
         if (! anyChange && coeffsValid) return;
         coeffsValid = true;
 
@@ -274,6 +295,40 @@ private:
         dither.setMode (p.dither);
     }
 
+    // A module (or a mode's copy of it) only runs while it is audible: on, or
+    // fading in or out. When it becomes active again its state is cleared; the
+    // 20 ms fade-in covers the restart. This is the main CPU saving: idle modules cost nothing.
+    bool live (int idx) const noexcept { return smooth[(size_t) idx].value() > 0.0 || smooth[(size_t) idx].getTarget() > 0.0; }
+
+    void updateActivity (bool force) noexcept
+    {
+        auto upd = [force] (bool& flag, bool now, auto&& onStart)
+        {
+            if (now && (! flag || force)) onStart();
+            flag = now;
+        };
+        const bool eqOn = live (kWetEq);
+        upd (act.lowCut, live (kWetLowCut), [this] { for (auto& ch : lowCut) for (auto& f : ch) f.reset(); });
+        upd (act.eqLR, eqOn && live (kEqSt), [this] { for (size_t c = 0; c < 2; ++c) for (auto& f : eq[c]) f.reset(); });
+        upd (act.eqM, eqOn && live (kEqMid), [this] { for (auto& f : eq[2]) f.reset(); });
+        upd (act.eqS, eqOn && live (kEqSide), [this] { for (auto& f : eq[3]) f.reset(); });
+        upd (act.mono, live (kWetMono), [this] { monoBassXo.reset(); monoBassAp.reset(); });
+        const bool mbOn = live (kWetMb);
+        upd (act.mbLR, mbOn && live (kMbSt), [this] { for (size_t c = 0; c < 2; ++c) { for (auto& f : xo[c]) f.reset(); xoAp[c].reset(); }
+                                                          for (auto& c : bandComp[0]) c.reset(); });
+        upd (act.mbM, mbOn && live (kMbMid), [this] { for (auto& f : xo[2]) f.reset(); xoAp[2].reset(); for (auto& a : msAp[1]) a.reset();
+                                                         for (auto& c : bandComp[1]) c.reset(); });
+        upd (act.mbS, mbOn && live (kMbSide), [this] { for (auto& f : xo[3]) f.reset(); xoAp[3].reset(); for (auto& a : msAp[0]) a.reset();
+                                                          for (auto& c : bandComp[2]) c.reset(); });
+        upd (act.dyn, live (kWetDyn), [this] { for (auto& b : dynBand) b.reset(); for (auto& c : dynComp) c.reset(); });
+        upd (act.glue, live (kWetComp), [this] { glue.reset(); for (auto& f : scHpf) f.reset(); autoMakeupDb = 0.0; });
+        upd (act.sat, live (kWetSat), [this] { for (auto& o : os) o.reset(); for (auto& d : dc) d.reset(); });
+        upd (act.clip, live (kWetClip), [this] { for (auto& o : clipOs) o.reset(); });
+    }
+
+    struct Activity { bool lowCut = false, eqLR = false, eqM = false, eqS = false, mono = false, mbLR = false, mbM = false, mbS = false,
+                      dyn = false, glue = false, sat = false, clip = false; } act;
+
     static inline double mix (double dry, double wet, double amt) noexcept { return dry + (wet - dry) * amt; }
 
     // 3-band split of one channel (index ch). The low band gets the high
@@ -288,8 +343,8 @@ private:
 
     inline void processSample (double& l, double& r) noexcept
     {
-        // Every module runs all the time and is crossfaded by its "wet" amount, so
-        // bypass switches are click-free and filter states are always warm.
+        // Every module is crossfaded by its "wet" amount, so on/off switches are
+        // click-free. Modules that are fully off are skipped (see updateActivity).
         const double inL = l, inR = r;
 
         // Input
@@ -297,57 +352,99 @@ private:
         l *= ig; r *= ig;
 
         // EQ: the low cut works on L/R; the four matched bands run as stereo, mid-only or side-only
+        if (act.lowCut)
         {
             const double lc = v (kWetLowCut);
-            const double el = mix (l, lowCut[0][1].process (lowCut[0][0].process (l)), lc);
-            const double er = mix (r, lowCut[1][1].process (lowCut[1][0].process (r)), lc);
-            const double m = 0.5 * (el + er), s = 0.5 * (el - er);
-            double c[4] = { el, er, m, s }; // L, R, M, S
-            for (size_t ch = 0; ch < 4; ++ch)
-                for (auto& f : eq[ch]) c[ch] = f.process (c[ch]);
-            const double wSt = v (kEqSt), wM = v (kEqMid), wS = v (kEqSide);
-            const double fl = wSt * c[0] + wM * (c[2] + s) + wS * (m + c[3]);
-            const double fr = wSt * c[1] + wM * (c[2] - s) + wS * (m - c[3]);
+            l = mix (l, lowCut[0][1].process (lowCut[0][0].process (l)), lc);
+            r = mix (r, lowCut[1][1].process (lowCut[1][0].process (r)), lc);
+        }
+        if (act.eqLR || act.eqM || act.eqS)
+        {
+            const double m = 0.5 * (l + r), s = 0.5 * (l - r);
+            double fl = 0.0, fr = 0.0;
+            if (act.eqLR)
+            {
+                double cl = l, cr = r;
+                for (auto& f : eq[0]) cl = f.process (cl);
+                for (auto& f : eq[1]) cr = f.process (cr);
+                fl += v (kEqSt) * cl; fr += v (kEqSt) * cr;
+            }
+            if (act.eqM)
+            {
+                double cm = m;
+                for (auto& f : eq[2]) cm = f.process (cm);
+                fl += v (kEqMid) * (cm + s); fr += v (kEqMid) * (cm - s);
+            }
+            if (act.eqS)
+            {
+                double cs = s;
+                for (auto& f : eq[3]) cs = f.process (cs);
+                fl += v (kEqSide) * (m + cs); fr += v (kEqSide) * (m - cs);
+            }
+            // While switching modes the weights cross-fade; any weight not covered by an active set passes the input.
+            const double rest = 1.0 - (act.eqLR ? v (kEqSt) : 0.0) - (act.eqM ? v (kEqMid) : 0.0) - (act.eqS ? v (kEqSide) : 0.0);
+            fl += rest * l; fr += rest * r;
             const double w = v (kWetEq);
-            l = mix (el, fl, w);
-            r = mix (er, fr, w);
+            l = mix (l, fl, w);
+            r = mix (r, fr, w);
         }
 
         // Stereo: mid/side width plus mono bass. The side channel gets an LR4
         // high-pass; mid gets the matching allpass so M and S stay phase-aligned.
         {
-            double m = 0.5 * (l + r), s = 0.5 * (l - r);
-            double lo, hi;
-            monoBassXo.process (s, lo, hi);
-            const double mAp = monoBassAp.process (m);
-            const double mono = v (kWetMono);
-            s = mix (s, hi, mono);
-            m = mix (m, mAp, mono);
-            s *= mix (1.0, v (kWidth), v (kWetStereo));
-            if (v (kWetStereo) > 0.0 || mono > 0.0) { l = m + s; r = m - s; }
+            const double mono = act.mono ? v (kWetMono) : 0.0;
+            const double wst = v (kWetStereo);
+            if (wst > 0.0 || mono > 0.0)
+            {
+                double m = 0.5 * (l + r), s = 0.5 * (l - r);
+                if (act.mono)
+                {
+                    double lo, hi;
+                    monoBassXo.process (s, lo, hi);
+                    const double mAp = monoBassAp.process (m);
+                    s = mix (s, hi, mono);
+                    m = mix (m, mAp, mono);
+                }
+                s *= mix (1.0, v (kWidth), wst);
+                l = m + s; r = m - s;
+            }
         }
 
         // Three-band compressor (stereo-linked on L/R, or on mid or side alone).
         // In mid or side mode the untouched channel goes through the same allpass
         // pair as the band sum, so M and S stay phase-coherent.
+        if (act.mbLR || act.mbM || act.mbS)
         {
             const double m = 0.5 * (l + r), s = 0.5 * (l - r);
-            double bl[3], br[3], bm[3], bs[3];
-            split (0, l, bl); split (1, r, br); split (2, m, bm); split (3, s, bs);
-            const double mAp = msAp[0][1].process (msAp[0][0].process (m));
-            const double sAp = msAp[1][1].process (msAp[1][0].process (s));
-            double sl = 0, sr = 0, mm = 0, ss = 0;
-            for (size_t b = 0; b < 3; ++b)
+            double ol = 0.0, orr = 0.0, used = 0.0;
+            if (act.mbLR)
             {
-                const double bg = v (kBg0 + (int) b);
-                sl += bl[b] * (bandComp[0][b].process (std::max (std::abs (bl[b]), std::abs (br[b]))) * bg);
-                sr += br[b] * (bandComp[0][b].getLastGain() * bg);
-                mm += bm[b] * (bandComp[1][b].process (bm[b]) * bg);
-                ss += bs[b] * (bandComp[2][b].process (bs[b]) * bg);
+                double bl[3], br[3], sl = 0, sr = 0;
+                split (0, l, bl); split (1, r, br);
+                for (size_t b = 0; b < 3; ++b)
+                {
+                    const double g = bandComp[0][b].process (std::max (std::abs (bl[b]), std::abs (br[b]))) * v (kBg0 + (int) b);
+                    sl += bl[b] * g; sr += br[b] * g;
+                }
+                ol += v (kMbSt) * sl; orr += v (kMbSt) * sr; used += v (kMbSt);
             }
-            const double wSt = v (kMbSt), wM = v (kMbMid), wS = v (kMbSide);
-            const double ol = wSt * sl + wM * (mm + sAp) + wS * (mAp + ss);
-            const double orr = wSt * sr + wM * (mm - sAp) + wS * (mAp - ss);
+            if (act.mbM)
+            {
+                double bm[3], mm = 0;
+                split (2, m, bm);
+                for (size_t b = 0; b < 3; ++b) mm += bm[b] * (bandComp[1][b].process (bm[b]) * v (kBg0 + (int) b));
+                const double sAp = msAp[1][1].process (msAp[1][0].process (s));
+                ol += v (kMbMid) * (mm + sAp); orr += v (kMbMid) * (mm - sAp); used += v (kMbMid);
+            }
+            if (act.mbS)
+            {
+                double bs[3], ss = 0;
+                split (3, s, bs);
+                for (size_t b = 0; b < 3; ++b) ss += bs[b] * (bandComp[2][b].process (bs[b]) * v (kBg0 + (int) b));
+                const double mAp = msAp[0][1].process (msAp[0][0].process (m));
+                ol += v (kMbSide) * (mAp + ss); orr += v (kMbSide) * (mAp - ss); used += v (kMbSide);
+            }
+            ol += (1.0 - used) * l; orr += (1.0 - used) * r;
             // Fully off is bit-exact dry. The 20 ms toggle fade is the only moment
             // the crossover's allpass phase mixes with the dry signal.
             const double amt = v (kWetMb);
@@ -355,6 +452,7 @@ private:
         }
 
         // Dynamic EQ: two constant-Q bells that cut only while their band is loud
+        if (act.dyn)
         {
             double dl = l, dr = r;
             for (size_t b = 0; b < 2; ++b)
@@ -371,6 +469,7 @@ private:
 
         // Glue compressor: stereo-linked, high-passed sidechain, parallel mix,
         // optional auto release and auto makeup
+        if (act.glue)
         {
             const double scl = scHpf[0].process (l), scr = scHpf[1].process (r);
             const double gr = glue.process (std::max (std::abs (scl), std::abs (scr)));
@@ -388,19 +487,55 @@ private:
         // so latency stays constant.
         {
             const double bl = satBypassDelay[0].process (l), br = satBypassDelay[1].process (r);
-            const double d = v (kSatDrive), b = v (kSatWarm) * 0.6, m = v (kSatMix);
-            const double tb = std::tanh (b);
-            const double norm = 1.0 / (d * (1.0 - tb * tb));
-            auto shaper = [=] (double x) { return x + ((std::tanh (d * x + b) - tb) * norm - x) * m; };
-            const double sl = dc[0].process (os[0].process (l, shaper));
-            const double sr = dc[1].process (os[1].process (r, shaper));
-            const double wet = v (kWetSat);
-            l = mix (bl, sl, wet); r = mix (br, sr, wet);
+            if (act.sat)
+            {
+                const double d = v (kSatDrive), b = v (kSatWarm) * 0.6, m = v (kSatMix);
+                const double tb = std::tanh (b);
+                const double norm = 1.0 / (d * (1.0 - tb * tb));
+                auto shaper = [=] (double x) { return x + ((std::tanh (d * x + b) - tb) * norm - x) * m; };
+                const double sl = dc[0].process (os[0].process (l, shaper));
+                const double sr = dc[1].process (os[1].process (r, shaper));
+                const double wet = v (kWetSat);
+                l = mix (bl, sl, wet); r = mix (br, sr, wet);
+            }
+            else { l = bl; r = br; }
+        }
+
+        // Drive (into clipper and limiter)
+        const double lg = v (kLimGain);
+        l *= lg; r *= lg;
+
+        // Soft clipper, 4x oversampled: shaves the sharpest peaks so the limiter
+        // has less to do ("clip then limit"). It is louder for the same amount of
+        // audible limiting, because a few samples of clipping are less audible than
+        // limiter gain-pumping. The threshold is relative to the limiter ceiling;
+        // the limiter after it still guarantees the true-peak ceiling.
+        {
+            const double bl = clipBypassDelay[0].process (l), br = clipBypassDelay[1].process (r);
+            if (act.clip)
+            {
+                const double t = v (kClipLevel);
+                const double k0 = t * (1.0 - 0.5 * v (kClipSoft));
+                const double span = std::max (t - k0, 1.0e-9);
+                double red = 1.0;
+                auto clipper = [t, k0, span, &red] (double x)
+                {
+                    const double a = std::abs (x);
+                    if (a <= k0) return x;
+                    const double y = (t > k0) ? k0 + span * std::tanh ((a - k0) / span) : t;
+                    red = std::max (red, a / y);
+                    return x < 0.0 ? -y : y;
+                };
+                const double cl = clipOs[0].process (l, clipper);
+                const double cr = clipOs[1].process (r, clipper);
+                clipRedMax = std::max (clipRedMax, red);
+                const double wet = v (kWetClip);
+                l = mix (bl, cl, wet); r = mix (br, cr, wet);
+            }
+            else { l = bl; r = br; }
         }
 
         // Limiter
-        const double lg = v (kLimGain);
-        l *= lg; r *= lg;
         limiter.process (l, r);
         if (params.limOn)
         {
@@ -441,6 +576,16 @@ private:
                 const double orr = wOff * r + wByp * mdr + wDel * (r - mdr);
                 l = ol; r = orr;
             }
+        }
+
+        // Monitoring: mono check or side-only listen (affects what you hear, not the meters)
+        if (v (kMonSt) < 1.0)
+        {
+            const double m = 0.5 * (l + r), sd = 0.5 * (l - r);
+            const double ws = v (kMonSt), wm = v (kMonMono), wd = v (kMonSide);
+            const double ol = ws * l + wm * m + wd * sd;
+            const double orr = ws * r + wm * m + wd * sd;
+            l = ol; r = orr;
         }
 
         // Dither
@@ -519,6 +664,9 @@ private:
     std::array<Oversampler4x, 2> os;
     std::array<DelayLine, 2> satBypassDelay;
     std::array<DcBlocker, 2> dc;
+    std::array<Oversampler4x, 2> clipOs;
+    std::array<DelayLine, 2> clipBypassDelay;
+    double clipRedMax = 1.0;
     int satLatency = 0;
     TruePeakLimiter limiter;
     double currentLookahead = -1.0;

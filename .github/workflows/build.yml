@@ -3,6 +3,7 @@ name: Build
 on:
   push:
     branches: [main]
+    tags: ["v*"]          # pushing a tag like v1.2.0 builds everything and publishes a GitHub Release
   pull_request:
   workflow_dispatch:
 
@@ -74,7 +75,51 @@ jobs:
           cp -R "build/MasterBlaster_artefacts/Release/VST3/Master Blaster.vst3" dist/
           if [ -d "build/MasterBlaster_artefacts/Release/AU" ]; then cp -R "build/MasterBlaster_artefacts/Release/AU/Master Blaster.component" dist/; fi
 
+      - name: Zip for release
+        shell: bash
+        run: |
+          mkdir -p release
+          name="MasterBlaster-${GITHUB_REF_NAME//\//-}-${{ matrix.name }}.zip"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            # ditto keeps the bundles' metadata intact
+            ditto -c -k --sequesterRsrc dist "release/$name"
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -tzip "release/$name" ./dist/*
+          else
+            (cd dist && zip -qr "../release/$name" .)
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: MasterBlaster-${{ matrix.name }}
           path: dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: release
+
+  release:
+    # Runs only for version tags, after all three platforms built and passed their checks.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ls -l release
+          gh release create "$GITHUB_REF_NAME" release/*.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Master Blaster $GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes "Unsigned builds. macOS: copy the .component to ~/Library/Audio/Plug-Ins/Components and the .vst3 to ~/Library/Audio/Plug-Ins/VST3, then run: xattr -dr com.apple.quarantine on both. Windows: copy the .vst3 to C:\\Program Files\\Common Files\\VST3. Linux: copy the .vst3 to ~/.vst3."

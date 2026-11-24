@@ -399,6 +399,117 @@ static void testModesAndCompare()
     }
 }
 
+static void testLoudnessRange()
+{
+    // EBU Tech 3342 cases: 20 s of a 1 kHz stereo tone at level A, then 20 s at level B. LRA = |A - B| (+/- 1 LU).
+    const double fs = 48000.0;
+    const std::pair<double, double> cases[] = { { -20.0, -30.0 }, { -20.0, -15.0 }, { -40.0, -20.0 } };
+    for (auto [a, b] : cases)
+    {
+        LoudnessMeter m; m.prepare (fs);
+        for (int seg = 0; seg < 2; ++seg)
+        {
+            const double amp = dbToGain (seg == 0 ? a : b);
+            for (int i = 0; i < (int) fs * 20; ++i) { const double x = amp * std::sin (2 * kPi * 1000.0 / fs * i); m.process (x, x); }
+        }
+        const double expected = std::abs (a - b);
+        check (std::abs (m.getLoudnessRange() - expected) <= 1.0,
+               "LRA (EBU 3342) " + std::to_string ((int) a) + "/" + std::to_string ((int) b) + " dBFS, expect " + std::to_string ((int) expected) + " LU",
+               m.getLoudnessRange());
+    }
+}
+
+static void testClipperAndMonitor()
+{
+    const double fs = 48000.0;
+    // Clipper alone (limiter off): a sine at twice the threshold comes out at about the threshold.
+    {
+        MasterChain c; auto p = allOff(); p.clipOn = true; p.clipLevelDb = 0.0; p.clipSoftness = 0.0; p.limCeilingDb = -6.0;
+        c.setParams (p); c.prepare (fs);
+        std::vector<double> L, R;
+        const double amp = dbToGain (-6.0) * 2.0;
+        runChain (c, [&] (int i, double& l, double& r) { l = r = amp * std::sin (2 * kPi * 200.0 / fs * i); }, (int) fs, L, R, (int) fs / 2);
+        double peak = 0; for (double v : L) peak = std::max (peak, std::abs (v));
+        check (std::abs (gainToDb (peak) - (-6.0)) < 0.5, "hard clipper holds a 2x sine at its threshold (dBFS)", gainToDb (peak));
+    }
+    // Clip then limit: the ceiling still holds, and the limiter works less hard.
+    auto limiterWork = [&] (bool clip, double& peakOut, double& tpOut)
+    {
+        MasterChain c; ChainParams p; p.limGainDb = 12.0; p.clipOn = clip; p.clipLevelDb = 0.0; p.clipSoftness = 0.5;
+        c.setParams (p); c.prepare (fs);
+        std::mt19937 rng (9); std::normal_distribution<double> nd (0.0, 0.15);
+        std::vector<double> L (256), R (256);
+        double grSum = 0; int blocks = 0; peakOut = 0;
+        for (int done = 0; done < (int) fs * 6; done += 256)
+        {
+            for (int i = 0; i < 256; ++i)
+            {
+                const double kick = 0.6 * std::sin (2 * kPi * 50.0 / fs * (done + i)) * std::exp (-((done + i) % 24000) / 3000.0);
+                L[(size_t) i] = nd (rng) + kick; R[(size_t) i] = nd (rng) + kick;
+            }
+            c.process (L.data(), R.data(), 256);
+            if (done > fs) { grSum += c.getMeters().limGrDb; ++blocks; for (int i = 0; i < 256; ++i) peakOut = std::max ({ peakOut, std::abs (L[(size_t) i]), std::abs (R[(size_t) i]) }); }
+        }
+        tpOut = c.getMeters().truePeakMaxDb;
+        return grSum / blocks;
+    };
+    double pk0, tp0, pk1, tp1;
+    const double grNoClip = limiterWork (false, pk0, tp0), grClip = limiterWork (true, pk1, tp1);
+    check (grClip < grNoClip * 0.8, "clipper takes work off the limiter (avg limiter GR dB, clip on)", grClip);
+    std::printf ("       (avg limiter GR without clipper: %.2f dB)\n", grNoClip);
+    check (pk1 <= dbToGain (-1.0) + 1e-12 && tp1 <= -1.0 + 0.01, "clip + limit: true peak still <= ceiling (dBTP)", tp1);
+
+    // Monitor modes
+    {
+        MasterChain c; auto p = allOff(); p.monitor = 1;
+        c.setParams (p); c.prepare (fs);
+        std::mt19937 rng (3); std::normal_distribution<double> nd (0.0, 0.2);
+        std::vector<double> L, R;
+        runChain (c, [&] (int, double& l, double& r) { l = nd (rng); r = nd (rng); }, 24000, L, R, 4800);
+        double d = 0; for (size_t i = 0; i < L.size(); ++i) d = std::max (d, std::abs (L[i] - R[i]));
+        check (d < 1e-15, "monitor mono: L == R", d);
+    }
+    {
+        MasterChain c; auto p = allOff(); p.monitor = 2;
+        c.setParams (p); c.prepare (fs);
+        std::mt19937 rng (3); std::normal_distribution<double> nd (0.0, 0.2);
+        std::vector<double> L, R;
+        runChain (c, [&] (int, double& l, double& r) { l = r = nd (rng); }, 24000, L, R, 4800);
+        check (rmsDb (L) < -200.0 || rmsDb (L) == -150.0, "monitor side: a mono signal is silent (dBFS RMS)", rmsDb (L));
+    }
+}
+
+static void testToggleStress()
+{
+    // Switch modules and modes at random while audio plays: output must stay finite and under the ceiling.
+    const double fs = 44100.0;
+    MasterChain c; ChainParams p; p.limGainDb = 6.0;
+    c.setParams (p); c.prepare (fs);
+    std::mt19937 rng (21); std::normal_distribution<double> nd (0.0, 0.2); std::uniform_int_distribution<int> coin (0, 1), mode (0, 2);
+    std::vector<double> L (128), R (128);
+    double peak = 0; bool finite = true;
+    for (int blk = 0; blk < (int) (fs * 20 / 128); ++blk)
+    {
+        if (blk % 40 == 0)
+        {
+            p.eqOn = coin (rng); p.eqMode = mode (rng); p.highShelfDb = 4.0; p.lowCutOn = coin (rng);
+            p.stereoOn = coin (rng); p.monoBassOn = coin (rng);
+            p.mbOn = coin (rng); p.mbMode = mode (rng); p.bandThreshDb = { -30.0, -30.0, -30.0 }; p.bandRatio = { 3.0, 3.0, 3.0 };
+            p.dynOn = coin (rng); p.compOn = coin (rng); p.compAutoMakeup = coin (rng); p.satOn = coin (rng); p.clipOn = coin (rng);
+            c.setParams (p);
+        }
+        for (int i = 0; i < 128; ++i) { L[(size_t) i] = nd (rng); R[(size_t) i] = nd (rng); }
+        c.process (L.data(), R.data(), 128);
+        for (int i = 0; i < 128; ++i)
+        {
+            finite &= std::isfinite (L[(size_t) i]) && std::isfinite (R[(size_t) i]);
+            peak = std::max ({ peak, std::abs (L[(size_t) i]), std::abs (R[(size_t) i]) });
+        }
+    }
+    check (finite, "random module toggling: output finite", 1);
+    check (peak <= dbToGain (-1.0) + 1e-12, "random module toggling: sample peak <= ceiling (dBFS)", gainToDb (peak));
+}
+
 int main()
 {
     testHalfband();
@@ -411,6 +522,9 @@ int main()
     testTruePeakDetector();
     testDynamicEq();
     testModesAndCompare();
+    testLoudnessRange();
+    testClipperAndMonitor();
+    testToggleStress();
     std::printf (failures ? "\n%d FAILURE(S)\n" : "\nALL TESTS PASSED\n", failures);
     return failures ? 1 : 0;
 }

@@ -5,6 +5,10 @@
 // hundreds a linear-phase FIR needs, and the image rejection stays high.
 #include "Common.h"
 #include <array>
+#include <cstring>
+#if defined(_MSC_VER) && ! defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
+ #include <xmmintrin.h>
+#endif
 
 namespace mb
 {
@@ -185,44 +189,107 @@ public:
             const double w = bessel0 (beta * std::sqrt (std::max (0.0, 1.0 - r * r))) / bessel0 (beta);
             h[(size_t) i] = sinc * w;
         }
+        // Coefficients are stored tap-major ([tap][phase], oldest tap first), so
+        // every input sample updates all the phase sums at once. That is a plain
+        // vertical multiply-add the compiler vectorises without reordering any
+        // floating-point maths. Single precision is ample for peak detection
+        // (error ~1e-7 relative).
+        l1Max = 0.0;
         for (int p = 1; p < kOver; ++p)
+        {
+            double l1 = 0.0;
             for (int k = 0; k < kTaps; ++k)
             {
                 const int idx = kOver * k + p;
-                phase[(size_t) p - 1][(size_t) k] = idx < len ? h[(size_t) idx] : 0.0;
+                const double c = idx < len ? h[(size_t) idx] : 0.0;
+                coef[(size_t) (kTaps - 1 - k)][(size_t) p - 1] = (float) c;
+                l1 += std::abs (c);
             }
+            l1Max = std::max (l1Max, l1);
+        }
         reset();
     }
 
-    void reset() { hist.fill (0.0); pos = 0; }
+    void reset() { hist.fill (0.0f); pos = 0; }
+
+    // Callers that only care about peaks above some level (the limiter: its
+    // ceiling; a max-hold meter: the current maximum) can set it here. When the
+    // window is provably below it, the interpolation is skipped.
+    void setSkipBelow (double level) noexcept { skipBelow = level; }
 
     // Pushes a sample and returns the peak magnitude of the window around
     // x[n - kDelay]: both neighbouring samples plus the interpolated points
     // between them.
     inline double process (double x) noexcept
     {
-        hist[pos] = x;
-        hist[pos + kTaps] = x; // mirrored so each read is one contiguous span
-        const double* h = &hist[pos + 1]; // h[kTaps-1] is the newest sample
-        // v[0] = x[n-D], v[kOver] = x[n-D+1], interpolated points in between
-        std::array<double, (size_t) kOver + 1> v {};
-        v[0] = h[kTaps - 1 - kDelay];
-        v[(size_t) kOver] = h[kTaps - kDelay];
-        for (int p = 0; p < kOver - 1; ++p)
+        hist[pos] = (float) x;
+        hist[pos + kTaps] = (float) x; // mirrored so each read is one contiguous span
+        const float* h = &hist[pos + 1]; // h[0] oldest ... h[kTaps-1] newest
+        if (++pos == (size_t) kTaps) pos = 0;
+
+        const double s0 = std::abs ((double) h[kTaps - 1 - kDelay]);
+        const double s1 = std::abs ((double) h[kTaps - kDelay]);
+        double peak = std::max (s0, s1);
+        if (skipBelow > 0.0)
         {
-            double acc = 0.0;
-            const auto& c = phase[(size_t) p];
-            for (int k = 0; k < kTaps; ++k) acc += c[(size_t) k] * h[kTaps - 1 - k];
-            v[(size_t) p + 1] = acc;
+            float winMax = 0.0f;
+            for (int k = 0; k < kTaps; ++k) winMax = std::max (winMax, std::abs (h[k]));
+            if ((double) winMax * l1Max < skipBelow) return peak; // no inter-sample value can reach skipBelow
         }
+
+        alignas (32) std::array<float, kPhasesPadded> acc {};
+#if defined(__GNUC__) || defined(__clang__)
+        // Keep the phase sums in vector registers across the taps (GCC/Clang vector
+        // extensions; they compile to SSE/AVX on x86 and NEON on ARM).
+        typedef float v4 __attribute__ ((vector_size (16)));
+        constexpr size_t nv = kPhasesPadded / 4;
+        v4 sums[nv];
+        for (size_t j = 0; j < nv; ++j) sums[j] = v4 { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (int k = 0; k < kTaps; ++k)
+        {
+            const float hk = h[k];
+            const v4 hv = { hk, hk, hk, hk };
+            const float* c = coef[(size_t) k].data();
+            for (size_t j = 0; j < nv; ++j)
+            {
+                v4 cv;
+                std::memcpy (&cv, c + 4 * j, sizeof (cv));
+                sums[j] += cv * hv;
+            }
+        }
+        std::memcpy (acc.data(), sums, sizeof (sums));
+#elif defined(_M_X64) || defined(_M_IX86)
+        // MSVC on x86: the same register-resident sums with SSE intrinsics.
+        constexpr size_t nv = kPhasesPadded / 4;
+        __m128 sums[nv];
+        for (size_t j = 0; j < nv; ++j) sums[j] = _mm_setzero_ps();
+        for (int k = 0; k < kTaps; ++k)
+        {
+            const __m128 hv = _mm_set1_ps (h[k]);
+            const float* c = coef[(size_t) k].data();
+            for (size_t j = 0; j < nv; ++j) sums[j] = _mm_add_ps (sums[j], _mm_mul_ps (_mm_load_ps (c + 4 * j), hv));
+        }
+        for (size_t j = 0; j < nv; ++j) _mm_store_ps (acc.data() + 4 * j, sums[j]);
+#else
+        for (int k = 0; k < kTaps; ++k)
+        {
+            const float hk = h[k];
+            const float* c = coef[(size_t) k].data();
+            for (size_t p = 0; p < kPhasesPadded; ++p) acc[p] += c[p] * hk;
+        }
+#endif
+        std::array<double, (size_t) kOver + 1> v {};
+        v[0] = s0;
+        v[(size_t) kOver] = s1;
+        for (int p = 0; p < kOver - 1; ++p) v[(size_t) p + 1] = std::abs ((double) acc[(size_t) p]);
         int best = 0;
-        double peak = 0.0;
+        peak = 0.0;
         for (int i = 0; i <= kOver; ++i)
-            if (std::abs (v[(size_t) i]) > peak) { peak = std::abs (v[(size_t) i]); best = i; }
+            if (v[(size_t) i] > peak) { peak = v[(size_t) i]; best = i; }
         // Parabolic refinement: the true maximum usually falls between grid points.
         if (best > 0 && best < kOver)
         {
-            const double a = std::abs (v[(size_t) best - 1]), b = peak, c = std::abs (v[(size_t) best + 1]);
+            const double a = v[(size_t) best - 1], b = peak, c = v[(size_t) best + 1];
             const double den = a - 2.0 * b + c;
             if (den < 0.0)
             {
@@ -230,14 +297,15 @@ public:
                 peak = std::max (peak, b - 0.25 * (a - c) * d);
             }
         }
-        if (++pos == (size_t) kTaps) pos = 0;
         return peak;
     }
 
 private:
-    std::array<std::array<double, (size_t) kTaps>, (size_t) kOver - 1> phase {};
-    std::array<double, (size_t) kTaps * 2 + 1> hist {};
+    static constexpr size_t kPhasesPadded = ((size_t) kOver - 1 + 7) / 8 * 8;
+    alignas (32) std::array<std::array<float, kPhasesPadded>, (size_t) kTaps> coef {};
+    alignas (32) std::array<float, (size_t) kTaps * 2 + 1> hist {};
     size_t pos = 0;
+    double l1Max = 1.0, skipBelow = 0.0;
 };
 
 using TruePeakDetector = TruePeakDetectorT<16, 48, 80>;

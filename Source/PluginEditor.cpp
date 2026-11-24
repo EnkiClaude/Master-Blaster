@@ -557,6 +557,9 @@ void MeterPanel::timerCallback()
     d.tp = m.truePeakMax.load();
     fall (d.comp, m.compGr.load(), 0.6f);
     fall (d.lim, m.limGr.load(), 0.6f);
+    fall (d.clip, m.clip.load(), 0.6f);
+    d.lra = m.loudnessRange.load();
+    proc.readHistory (histS.data(), histM.data(), (int) histS.size());
     d.makeup = m.autoMakeup.load();
     d.match = m.matchGain.load();
     d.m = m.momentary.load(); d.s = m.shortTerm.load(); d.i = m.integrated.load();
@@ -629,6 +632,7 @@ void MeterPanel::paint (Graphics& g)
     g.setFont (FontOptions (13.0f, Font::bold));
     g.drawText ("GAIN REDUCTION", area.removeFromTop (20), Justification::centredLeft);
     bar ("Glue", d.comp, 0.0f, 12.0f, true, colours::accent2);
+    bar ("Clipper", d.clip, 0.0f, 12.0f, true, colours::accent2);
     bar ("Limiter", d.lim, 0.0f, 12.0f, true, colours::warn);
     area.removeFromTop (6);
 
@@ -641,6 +645,8 @@ void MeterPanel::paint (Graphics& g)
         g.setColour (colours::text);
         g.drawText (value, b, Justification::centredRight);
     };
+    line ("Loudness range (LRA)", d.i > -69.0f ? String (d.lra, 1) + " LU" : String ("--"));
+    line ("Peak to loudness (PLR)", d.i > -69.0f && d.tp > -100.0f ? String (d.tp - d.i, 1) + " dB" : String ("--"));
     line ("Glue auto makeup", d.makeup > 0.05f ? "+" + String (d.makeup, 1) + " dB" : String ("off / 0.0 dB"));
     line ("Bypass level match", (d.match >= 0 ? "+" : "") + String (d.match, 1) + " dB");
     area.removeFromTop (6);
@@ -660,6 +666,46 @@ void MeterPanel::paint (Graphics& g)
         g.fillRect (Rectangle<float> (x - 2.0f, track.getY() - 2.0f, 4.0f, track.getHeight() + 4.0f));
         g.setColour (colours::text);
         g.drawText (String (d.corr, 2), txt, Justification::centredRight);
+    }
+
+    // Loudness history: last 60 s of short-term (line) and momentary (faint) loudness, with the target.
+    {
+        area.removeFromTop (10);
+        auto gArea = area.withTrimmedBottom (24);
+        g.setColour (colours::text);
+        g.setFont (FontOptions (13.0f, Font::bold));
+        g.drawText ("HISTORY (60 s)", gArea.removeFromTop (20), Justification::centredLeft);
+        auto plotR = gArea.toFloat().withTrimmedLeft (26.0f);
+        g.setColour (colours::bg);
+        g.fillRoundedRectangle (plotR, 3.0f);
+        const float hi = goal + 6.0f, lo = goal - 24.0f;
+        g.setFont (FontOptions (10.0f));
+        for (float db : { goal + 6.0f, goal, goal - 12.0f, goal - 24.0f })
+        {
+            const float y = jmap (db, lo, hi, plotR.getBottom(), plotR.getY());
+            g.setColour (db == goal ? colours::accent.withAlpha (0.5f) : colours::panelEdge);
+            g.drawHorizontalLine ((int) y, plotR.getX(), plotR.getRight());
+            g.setColour (colours::dim);
+            g.drawText (String ((int) db), (int) gArea.getX() - 2, (int) y - 7, 26, 14, Justification::centredLeft);
+        }
+        auto drawHist = [&] (const std::array<float, MasterBlasterProcessor::historySize>& h, Colour col, float thick)
+        {
+            Path p;
+            bool started = false;
+            const int n = (int) h.size();
+            for (int i = 0; i < n; ++i)
+            {
+                if (h[(size_t) i] < -69.0f) { started = false; continue; }
+                const float x = plotR.getX() + plotR.getWidth() * (float) i / (float) (n - 1);
+                const float y = jlimit (plotR.getY(), plotR.getBottom(), jmap (h[(size_t) i], lo, hi, plotR.getBottom(), plotR.getY()));
+                if (! started) { p.startNewSubPath (x, y); started = true; } else p.lineTo (x, y);
+            }
+            g.setColour (col);
+            g.strokePath (p, PathStrokeType (thick));
+        };
+        drawHist (histM, colours::dim.withAlpha (0.5f), 1.0f);
+        drawHist (histS, colours::accent, 1.6f);
+        historyArea = gArea;
     }
 
     g.setColour (colours::dim);
@@ -691,6 +737,7 @@ MasterBlasterEditor::MasterBlasterEditor (MasterBlasterProcessor& p)
       mb (p.state, "Multiband", "mbOn", 7),
       dyn (p.state, "Dynamic EQ", "dynOn", 5),
       glue (p.state, "Glue Comp", "compOn", 5),
+      clip (p.state, "Clipper", "clipOn", 2),
       lim (p.state, "Limiter", "limOn", 4),
       analyzer (p),
       meters (p)
@@ -720,6 +767,9 @@ MasterBlasterEditor::MasterBlasterEditor (MasterBlasterProcessor& p)
     sat.addKnob ("satDrive", "Drive");
     sat.addKnob ("satWarmth", "Warmth");
     sat.addKnob ("satMix", "Mix");
+
+    clip.addKnob ("clipLevel", "Level");
+    clip.addKnob ("clipSoft", "Softness");
 
     mb.addKnob ("xoverLow", "X-Low");
     mb.addKnob ("band0Thresh", "Low Thr");
@@ -778,6 +828,9 @@ MasterBlasterEditor::MasterBlasterEditor (MasterBlasterProcessor& p)
     lim.addToggle ("autoRelease", "Auto Rel");
     lim.addToggle ("truePeak", "True Peak");
     lim.addChoice ("dither", "Dither");
+    clip.setHeaderComponent (std::make_unique<mbgui::GrStrip> (std::vector<mbgui::GrStrip::Item> {
+                                 { "", [&m] { return m.clip.load(); } } }),
+                             70);
     lim.setHeaderComponent (std::make_unique<mbgui::GrStrip> (std::vector<mbgui::GrStrip::Item> {
                                 { "GR", [&m] { return m.limGr.load(); } } }),
                             120);
@@ -803,15 +856,19 @@ MasterBlasterEditor::MasterBlasterEditor (MasterBlasterProcessor& p)
         b.onClick = [this, i] { proc.selectSnapshot (i); };
         content.addAndMakeVisible (b);
     }
-    bypassButton.setTooltip ("Hear the unprocessed input at the same loudness as the processed output (level-matched bypass). "
-                             "Judges the processing, not the volume change.");
+    bypassButton.setTooltip ("Level-matched bypass: hear the unprocessed input at the same loudness as the processed output, "
+                             "so you judge the processing, not the volume change.");
+    monoButton.setTooltip ("Listen in mono (L+R)/2 to check mono compatibility. Monitoring only: the meters still read the stereo output.");
+    sideButton.setTooltip ("Listen to the side channel (L-R)/2 only: reveals stereo-only problems such as phasey reverb or harsh wide elements.");
+    monoButton.onClick = [this] { setMonitor (proc.monitor.load() == MasterBlasterProcessor::monitorMono ? 0 : MasterBlasterProcessor::monitorMono); };
+    sideButton.onClick = [this] { setMonitor (proc.monitor.load() == MasterBlasterProcessor::monitorSide ? 0 : MasterBlasterProcessor::monitorSide); };
     deltaButton.setTooltip ("Hear only what the processing adds or removes (processed minus level-matched input).");
     bypassButton.onClick = [this] { setCompare (proc.compare.load() == MasterBlasterProcessor::compareBypass ? 0 : MasterBlasterProcessor::compareBypass); };
     deltaButton.onClick = [this] { setCompare (proc.compare.load() == MasterBlasterProcessor::compareDelta ? 0 : MasterBlasterProcessor::compareDelta); };
-    for (auto* c : std::initializer_list<Component*> { &presetBox, &saveButton, &undoButton, &redoButton, &bypassButton, &deltaButton })
+    for (auto* c : std::initializer_list<Component*> { &presetBox, &saveButton, &undoButton, &redoButton, &bypassButton, &deltaButton, &monoButton, &sideButton })
         content.addAndMakeVisible (c);
 
-    for (auto* c : std::initializer_list<Component*> { &eq, &stereo, &sat, &mb, &dyn, &glue, &lim, &analyzer, &meters })
+    for (auto* c : std::initializer_list<Component*> { &eq, &stereo, &sat, &mb, &dyn, &glue, &clip, &lim, &analyzer, &meters })
         content.addAndMakeVisible (c);
     addAndMakeVisible (content);
     setLookAndFeel (&lnf); // after the children exist, so they all pick it up
@@ -856,11 +913,14 @@ void MasterBlasterEditor::timerCallback()
     }
     bypassButton.setToggleState (proc.compare.load() == MasterBlasterProcessor::compareBypass, dontSendNotification);
     deltaButton.setToggleState (proc.compare.load() == MasterBlasterProcessor::compareDelta, dontSendNotification);
+    monoButton.setToggleState (proc.monitor.load() == MasterBlasterProcessor::monitorMono, dontSendNotification);
+    sideButton.setToggleState (proc.monitor.load() == MasterBlasterProcessor::monitorSide, dontSendNotification);
     if (presetBox.getText() != proc.currentPresetName && ! presetBox.isPopupActive())
         presetBox.setText (proc.currentPresetName, dontSendNotification);
 }
 
 void MasterBlasterEditor::setCompare (int mode) { proc.compare.store (mode); timerCallback(); }
+void MasterBlasterEditor::setMonitor (int mode) { proc.monitor.store (mode); timerCallback(); }
 
 void MasterBlasterEditor::refreshPresetMenu()
 {
@@ -935,11 +995,10 @@ void MasterBlasterEditor::resized()
         redoButton.setBounds (h.removeFromLeft (52));
     }
     {
-        // Compare buttons sit above the meter column
+        // Compare and monitor buttons sit above the meter column
         auto c = Rectangle<int> (gap + leftW + gap, 0, metersW, headerH).withSizeKeepingCentre (metersW, 28);
-        bypassButton.setBounds (c.removeFromLeft (c.getWidth() * 2 / 3 - 3));
-        c.removeFromLeft (6);
-        deltaButton.setBounds (c);
+        const int w = (metersW - 3 * 5) / 4;
+        for (auto* b : { &bypassButton, &deltaButton, &monoButton, &sideButton }) { b->setBounds (c.removeFromLeft (w)); c.removeFromLeft (5); }
     }
 
     auto placeRow = [&] (std::initializer_list<mbgui::Panel*> panels, int y)
@@ -962,7 +1021,7 @@ void MasterBlasterEditor::resized()
     int y = headerH;
     placeRow ({ &eq, &lim }, y);            y += rowH + gap;
     placeRow ({ &mb, &glue }, y);           y += rowH + gap;
-    placeRow ({ &dyn, &stereo, &sat }, y);  y += rowH + gap;
+    placeRow ({ &dyn, &stereo, &sat, &clip }, y);  y += rowH + gap;
     analyzer.setBounds (gap, y, leftW, analyzerH);
     meters.setBounds (gap + leftW + gap, headerH, metersW, baseH - headerH - gap);
 }

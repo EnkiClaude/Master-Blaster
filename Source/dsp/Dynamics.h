@@ -192,6 +192,8 @@ public:
     void setParams (double ceilingDb, double releaseMs, bool autoRelease, bool truePeak) noexcept
     {
         ceiling = dbToGain (ceilingDb);
+        // The detectors only need to resolve peaks that could reach the ceiling (after the +0.06 dB margin).
+        for (auto& t : tp) t.setSkipBelow (ceiling / 1.007 * 0.999);
         relCoefBase = releaseMs;
         autoRel = autoRelease;
         tpOn = truePeak;
