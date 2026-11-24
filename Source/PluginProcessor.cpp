@@ -41,6 +41,7 @@ void MasterBlasterProcessor::process (juce::AudioBuffer<T>& buffer)
 
     reader.read (params);
     params.compare = compare.load (std::memory_order_relaxed);
+    params.monitor = monitor.load (std::memory_order_relaxed);
     chain.setParams (params);
     if (chain.applyLookaheadIfChanged()) setLatencySamples (chain.getLatencySamples());
 
@@ -97,6 +98,22 @@ void MasterBlasterProcessor::process (juce::AudioBuffer<T>& buffer)
     for (int b = 0; b < 3; ++b) meters.bandGr[b].store ((float) m.bandGrDb[(size_t) b]);
     for (int b = 0; b < 2; ++b) meters.dynGr[b].store ((float) m.dynGrDb[(size_t) b]);
     meters.autoMakeup.store ((float) m.autoMakeupDb);
+    meters.clip.store ((float) m.clipDb);
+    meters.loudnessRange.store ((float) m.loudnessRange);
+    // Loudness history: one entry per new 100 ms block
+    if (m.loudnessBlocks < lastLoudnessBlock) lastLoudnessBlock = m.loudnessBlocks; // meter was reset
+    if (m.loudnessBlocks > lastLoudnessBlock)
+    {
+        uint32_t w = histWrite.load (std::memory_order_relaxed);
+        for (long long i = lastLoudnessBlock; i < m.loudnessBlocks; ++i)
+        {
+            histShort[(size_t) (w % historySize)] = (float) m.shortTerm;
+            histMomentary[(size_t) (w % historySize)] = (float) m.momentary;
+            ++w;
+        }
+        histWrite.store (w, std::memory_order_release);
+        lastLoudnessBlock = m.loudnessBlocks;
+    }
     meters.matchGain.store ((float) m.matchGainDb);
     meters.momentary.store ((float) m.momentary);
     meters.shortTerm.store ((float) m.shortTerm);
@@ -284,6 +301,19 @@ void MasterBlasterProcessor::snapshotsFromTree (const juce::ValueTree& t)
             copy.removeProperty ("slot", nullptr);
             snapshots[(size_t) slot] = copy;
         }
+    }
+}
+
+void MasterBlasterProcessor::readHistory (float* shortTerm, float* momentary, int num) const
+{
+    num = juce::jmin (num, historySize);
+    const uint32_t w = histWrite.load (std::memory_order_acquire);
+    for (int i = 0; i < num; ++i)
+    {
+        const uint32_t idx = w + (uint32_t) (historySize - num + i);
+        const bool valid = (uint32_t) (num - i) <= w;
+        shortTerm[i] = valid ? histShort[(size_t) (idx % historySize)] : -150.0f;
+        momentary[i] = valid ? histMomentary[(size_t) (idx % historySize)] : -150.0f;
     }
 }
 

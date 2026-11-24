@@ -60,6 +60,12 @@ public:
     // ---- Compare (monitoring only; not saved, not automatable) ----------
     enum Compare { compareOff = 0, compareBypass, compareDelta };
     std::atomic<int> compare { compareOff };
+    enum Monitor { monitorStereo = 0, monitorMono, monitorSide };
+    std::atomic<int> monitor { monitorStereo };
+
+    // Loudness history for the graph: one short-term and one momentary value per 100 ms, last 60 s.
+    static constexpr int historySize = 600;
+    void readHistory (float* shortTerm, float* momentary, int num) const; // oldest first
 
     // ---- Analyzer feed: mono output samples, lock-free single producer ---
     static constexpr int analyzerSize = 1 << 15;
@@ -72,6 +78,7 @@ public:
         std::atomic<float> inPeak { -150.0f }, outPeak { -150.0f }, truePeakMax { -150.0f };
         std::atomic<float> compGr { 0.0f }, limGr { 0.0f }, bandGr[3] { { 0.0f }, { 0.0f }, { 0.0f } };
         std::atomic<float> dynGr[2] { { 0.0f }, { 0.0f } }, autoMakeup { 0.0f }, matchGain { 0.0f };
+        std::atomic<float> clip { 0.0f }, loudnessRange { 0.0f };
         std::atomic<float> momentary { -150.0f }, shortTerm { -150.0f }, integrated { -150.0f }, correlation { 1.0f };
     } meters;
 
@@ -90,6 +97,9 @@ private:
     int activeSnapshot = 0;
     std::vector<float> analyzerRing = std::vector<float> ((size_t) analyzerSize, 0.0f);
     std::atomic<uint32_t> analyzerWrite { 0 };
+    std::array<float, historySize> histShort {}, histMomentary {};
+    std::atomic<uint32_t> histWrite { 0 };
+    long long lastLoudnessBlock = 0;
 
     mbp::ParamReader reader;
     mb::MasterChain chain;

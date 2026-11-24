@@ -7,7 +7,7 @@ A one-stop **mastering chain** for your master bus: VST3 and AU (plus a standalo
 ## Signal chain
 
 ```
-Input → EQ → Stereo → Multiband → Dynamic EQ → Glue comp → Saturate (4x OS) → True-peak limiter → Compare → Dither
+Input → EQ → Stereo → Multiband → Dynamic EQ → Glue comp → Saturate (4x OS) → Drive → Clipper (4x OS) → True-peak limiter → Compare/Monitor → Dither
 ```
 
 | Stage | What it does | Technique |
@@ -18,10 +18,12 @@ Input → EQ → Stereo → Multiband → Dynamic EQ → Glue comp → Saturate 
 | **Dynamic EQ** | two bells that cut only while their band is loud (de-harsh, de-ess, tame boom) | constant-Q SVF band-pass, x + (g − 1)·BP(x): per-sample gain with no coefficient recalculation |
 | **Glue Comp** | stereo-linked bus compressor, sidechain HPF, parallel mix, **auto release**, **auto makeup** | Giannoulis/Reiss soft-knee feed-forward design; dual-envelope program-dependent release |
 | **Saturate** | tanh saturation with even-harmonic "Warmth" | 4x polyphase-IIR oversampling (>100 dB image rejection, a few samples of delay) |
+| **Clipper** | soft clipper before the limiter ("clip then limit"); level relative to the ceiling, knee softness | 4x polyphase-IIR oversampled tanh-knee clipper; in the tests it cuts the limiter's average gain reduction by about a third |
 | **Limiter** | brickwall limiter, ceiling in dBTP, auto release, lookahead 0.5–5 ms | 16x true-peak detection with parabolic refinement (<0.05 dB error to 0.45 fs); hold plus cascaded-box gain smoothing |
-| **Compare** | **Bypass (matched)**: the dry input at the processed loudness. **Delta**: only what the processing changes | latency-aligned dry path, K-weighted 3 s loudness match |
+| **Compare** | **Bypass**: the dry input at the processed loudness. **Delta**: only what the processing changes | latency-aligned dry path, K-weighted 3 s loudness match |
+| **Monitor** | **Mono** (L+R)/2 for mono-compatibility checks, **Side** (L−R)/2 to hear the stereo-only content | monitoring only; the meters keep reading the stereo output |
 | **Dither** | 24-bit or 16-bit TPDF, optional noise shaping | the last stage in the chain |
-| **Meters** | momentary, short-term and integrated LUFS, true-peak max, GR per stage, correlation | ITU-R BS.1770-4 / EBU R128 |
+| **Meters** | momentary, short-term and integrated LUFS, true-peak max, **loudness range (LRA)**, **peak-to-loudness ratio (PLR)**, **60 s loudness history**, GR per stage, correlation | ITU-R BS.1770-4 / EBU R128 / EBU Tech 3342 |
 | **Analyzer** | long-term output spectrum (+3 dB/oct tilt), EQ curve, **reference-track overlay** (loudness-aligned) | 8192-point FFT, 1/6-octave smoothing |
 
 Workflow tools:
@@ -42,6 +44,8 @@ Workflow tools:
 5. Check your decisions with **Bypass (matched)** and **Delta**. Because the bypass plays at the same loudness, "louder sounds better" can't fool you.
 6. Keep the ceiling at **−1 dBTP** for streaming/lossy formats. Turn dither on only when rendering to 16-bit, and only if your DAW isn't already dithering.
 
+**CPU:** a module that is switched off costs nothing, and the true-peak detectors use SIMD and skip work whenever the signal is provably below the level they care about. On the test machine (one core of a 2.3 GHz Xeon, 48 kHz) the defaults use about 2.5% and everything on about 5.5%; v1.1 used about 9.5% either way.
+
 Every module's **ON** switch crossfades, so you can toggle while playing. With every module off, the plugin outputs a bit-exact, latency-compensated copy of its input.
 
 ## Building
@@ -58,6 +62,8 @@ ctest --test-dir build -C Release      # DSP test suite
 * **Windows:** copy the `.vst3` to `C:\Program Files\Common Files\VST3`.
 * **Linux:** copy the `.vst3` to `~/.vst3`.
 * If you have a local JUCE checkout, pass `-DJUCE_DIR=/path/to/JUCE`.
+
+**Releases:** pushing a version tag (for example `git tag v1.2.0 && git push origin v1.2.0`) builds all three platforms, runs every check, and publishes a GitHub Release with a zip per platform.
 
 **Prebuilt binaries:** the GitHub Actions workflow builds macOS (VST3 + AU, universal), Windows and Linux. It runs the tests, pluginval and `auval`, and uploads the bundles as workflow artifacts. The builds are unsigned. On macOS, after copying the plugins, run:
 

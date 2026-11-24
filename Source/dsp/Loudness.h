@@ -63,7 +63,9 @@ public:
     void resetIntegrated()
     {
         hist.fill (0); histE.fill (0.0);
+        stHist.fill (0); stHistE.fill (0.0);
         integrated = -150.0;
+        lra = 0.0;
         totalBlocks = 0;
     }
 
@@ -78,6 +80,8 @@ public:
     double getMomentary() const noexcept { return momentary; }
     double getShortTerm() const noexcept { return shortTerm; }
     double getIntegrated() const noexcept { return integrated; }
+    double getLoudnessRange() const noexcept { return lra; }
+    long long getSubBlockCount() const noexcept { return subBlocksTotal; }
 
     static double energyToLufs (double e) { return e > 0.0 ? -0.691 + 10.0 * std::log10 (e) : -150.0; }
 
@@ -101,8 +105,14 @@ private:
             momentary = energyToLufs (e);
             addGatingBlock (e, momentary);
         }
-        if (subCount >= 30) shortTerm = energyToLufs (meanOf (30));
+        if (subCount >= 30)
+        {
+            const double e = meanOf (30);
+            shortTerm = energyToLufs (e);
+            addShortTermBlock (e, shortTerm);
+        }
         else if (subCount >= 4) shortTerm = energyToLufs (meanOf (subCount));
+        ++subBlocksTotal;
     }
 
     // 400 ms gating blocks with 75 % overlap; the absolute gate is -70 LUFS and the relative gate -10 LU.
@@ -123,8 +133,43 @@ private:
         integrated = n > 0 ? energyToLufs (sumE / (double) n) : -150.0;
     }
 
+    // Loudness Range (EBU Tech 3342): the 3 s short-term values (every 100 ms),
+    // gated at -70 LUFS absolute and 20 LU below their power average. LRA is
+    // the spread between the 10th and 95th percentiles.
+    void addShortTermBlock (double e, double lufs) noexcept
+    {
+        if (lufs < kMinLufs) return;
+        const int bin = std::clamp ((int) ((lufs - kMinLufs) / kBinWidth), 0, kBins - 1);
+        ++stHist[(size_t) bin]; stHistE[(size_t) bin] += e;
+
+        double sumE = 0.0; long long n = 0;
+        for (int i = 0; i < kBins; ++i) { sumE += stHistE[(size_t) i]; n += stHist[(size_t) i]; }
+        if (n == 0) return;
+        const double relGate = energyToLufs (sumE / (double) n) - 20.0;
+        const int startBin = std::clamp ((int) std::ceil ((relGate - kMinLufs) / kBinWidth), 0, kBins);
+        long long gated = 0;
+        for (int i = startBin; i < kBins; ++i) gated += stHist[(size_t) i];
+        if (gated < 2) { lra = 0.0; return; }
+        auto percentile = [&] (double q)
+        {
+            const double target = q * (double) (gated - 1);
+            long long cum = 0;
+            for (int i = startBin; i < kBins; ++i)
+            {
+                cum += stHist[(size_t) i];
+                if ((double) cum > target) return kMinLufs + (i + 0.5) * kBinWidth;
+            }
+            return kMinLufs + (kBins - 0.5) * kBinWidth;
+        };
+        lra = percentile (0.95) - percentile (0.10);
+    }
+
     double sampleRate = 48000.0;
     Biquad pre[2], rlb[2];
+    std::array<long long, kBins> stHist {};
+    std::array<double, kBins> stHistE {};
+    double lra = 0.0;
+    long long subBlocksTotal = 0;
     std::array<double, 30> sub {};
     int subPos = 0, subCount = 0, hop = 4800, accN = 0;
     double acc = 0.0;

@@ -149,7 +149,9 @@ private:
     MasterBlasterProcessor& proc;
     Knob target;
     juce::TextButton matchButton { "Auto Match" }, resetButton { "Reset" };
-    struct Disp { float in = -150, out = -150, tp = -150, comp = 0, lim = 0, makeup = 0, match = 0, m = -150, s = -150, i = -150, corr = 1; } d;
+    struct Disp { float in = -150, out = -150, tp = -150, comp = 0, lim = 0, clip = 0, makeup = 0, match = 0, m = -150, s = -150, i = -150, lra = 0, corr = 1; } d;
+    std::array<float, MasterBlasterProcessor::historySize> histS {}, histM {};
+    juce::Rectangle<int> historyArea;
     juce::String status;
 
     // Auto Match: measure, adjust the limiter drive, repeat until on target.
@@ -175,19 +177,20 @@ private:
     void presetChosen();
     void savePreset();
     void setCompare (int mode);
+    void setMonitor (int mode);
 
     MasterBlasterProcessor& proc;
     mbgui::LookAndFeel lnf;
     juce::TooltipWindow tooltips { this, 600 };
     juce::Component content;
-    mbgui::Panel eq, stereo, sat, mb, dyn, glue, lim;
+    mbgui::Panel eq, stereo, sat, mb, dyn, glue, clip, lim;
     mbgui::Analyzer analyzer;
     mbgui::MeterPanel meters;
 
     juce::ComboBox presetBox;
     juce::TextButton saveButton { "Save" }, undoButton { "Undo" }, redoButton { "Redo" };
     std::array<juce::TextButton, 4> snapButtons;
-    juce::TextButton bypassButton { "Bypass (matched)" }, deltaButton { "Delta" };
+    juce::TextButton bypassButton { "Bypass" }, deltaButton { "Delta" }, monoButton { "Mono" }, sideButton { "Side" };
     juce::Array<juce::File> userPresetFiles;
     std::unique_ptr<juce::AlertWindow> saveDialog;
 

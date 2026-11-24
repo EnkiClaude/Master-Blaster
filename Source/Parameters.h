@@ -138,6 +138,10 @@ inline APVTS::ParameterLayout createLayout()
     fl ("satWarmth", "Saturate Warmth", { 0.0f, 100.0f, 0.1f }, 0.0f, "%");
     fl ("satMix", "Saturate Mix", { 0.0f, 100.0f, 0.1f }, 100.0f, "%");
 
+    bo ("clipOn", "Clipper On", false);
+    fl ("clipLevel", "Clip Level", { -6.0f, 3.0f, 0.01f }, 0.0f, "dB");
+    fl ("clipSoft", "Clip Softness", { 0.0f, 100.0f, 0.1f }, 50.0f, "%");
+
     bo ("limOn", "Limiter On", true);
     fl ("limGain", "Limiter Drive", { 0.0f, 24.0f, 0.01f }, 0.0f, "dB");
     fl ("limCeiling", "Ceiling", { -12.0f, 0.0f, 0.01f }, -1.0f, "dBTP");
@@ -193,6 +197,7 @@ public:
         compAttack = r ("compAttack"); compRelease = r ("compRelease"); compKnee = r ("compKnee");
         compMakeup = r ("compMakeup"); compMix = r ("compMix"); compScHpf = r ("compScHpf");
         satOn = r ("satOn"); satDrive = r ("satDrive"); satWarmth = r ("satWarmth"); satMix = r ("satMix");
+        clipOn = r ("clipOn"); clipLevel = r ("clipLevel"); clipSoft = r ("clipSoft");
         limOn = r ("limOn"); limGain = r ("limGain"); limCeiling = r ("limCeiling"); limRelease = r ("limRelease");
         lookahead = r ("lookahead"); autoRelease = r ("autoRelease"); truePeak = r ("truePeak"); dither = r ("dither");
     }
@@ -229,6 +234,7 @@ public:
         p.compAttackMs = g (compAttack); p.compReleaseMs = g (compRelease); p.compKneeDb = g (compKnee);
         p.compMakeupDb = g (compMakeup); p.compMix = g (compMix) * 0.01; p.compScHpfHz = g (compScHpf);
         p.satOn = b (satOn); p.satDriveDb = g (satDrive); p.satWarmth = g (satWarmth) * 0.01; p.satMix = g (satMix) * 0.01;
+        p.clipOn = b (clipOn); p.clipLevelDb = g (clipLevel); p.clipSoftness = g (clipSoft) * 0.01;
         p.limOn = b (limOn); p.limGainDb = g (limGain); p.limCeilingDb = g (limCeiling); p.limReleaseMs = g (limRelease);
         p.lookaheadMs = lookaheadMs[juce::jlimit (0, 4, (int) std::lround (g (lookahead)))];
         p.autoRelease = b (autoRelease); p.truePeak = b (truePeak);
@@ -242,6 +248,7 @@ private:
       compOn, compThresh, compRatio, compAttack, compRelease, compKnee, compMakeup, compMix, compScHpf, satOn, satDrive,
       satWarmth, satMix, limOn, limGain, limCeiling, limRelease, lookahead, autoRelease, truePeak, dither;
     std::array<P, 3> bandThresh {}, bandRatio {}, bandGain {};
+    P clipOn, clipLevel, clipSoft;
     P eqMode, mbMode, dynOn, dynAttack, dynRelease, compAutoRel, compAutoMakeup;
     std::array<P, 2> dynHz {}, dynQ {}, dynThresh {}, dynRange {};
 };
@@ -277,6 +284,9 @@ inline juce::String tooltipFor (const juce::String& id)
         { "compAutoMakeup", "Adds back the average gain reduction so loudness stays the same while you compress." },
         { "satOn", "Saturation on/off." }, { "satDrive", "Saturation drive (output auto-compensated)." },
         { "satWarmth", "Adds even harmonics (asymmetric curve)." }, { "satMix", "Parallel saturation mix." },
+        { "clipOn", "Soft clipper before the limiter (4x oversampled). Shaves the sharpest peaks so the limiter works less: louder for the same amount of audible limiting." },
+        { "clipLevel", "Clip threshold relative to the limiter ceiling. 0 dB clips right at the ceiling; lower values clip harder." },
+        { "clipSoft", "Knee width. 0 % is a hard clip (brightest), 100 % is the gentlest curve." },
         { "limOn", "Limiter on/off." }, { "limGain", "Drives the mix into the limiter. This is your loudness control." },
         { "limCeiling", "Maximum true-peak output level. -1 dBTP is the streaming recommendation." },
         { "limRelease", "Limiter release (base time when Auto Release is on)." },
