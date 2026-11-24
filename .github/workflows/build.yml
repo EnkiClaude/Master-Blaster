@@ -6,6 +6,11 @@ on:
     tags: ["v*"]          # pushing a tag like v1.2.0 builds everything and publishes a GitHub Release
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "To publish a release, enter a version tag such as v1.2.0 (leave empty for a normal build)"
+        required: false
+        default: ""
 
 jobs:
   build:
@@ -77,9 +82,12 @@ jobs:
 
       - name: Zip for release
         shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           mkdir -p release
-          name="MasterBlaster-${GITHUB_REF_NAME//\//-}-${{ matrix.name }}.zip"
+          ver="${RELEASE_TAG:-$GITHUB_REF_NAME}"
+          name="MasterBlaster-${ver//\//-}-${{ matrix.name }}.zip"
           if [ "$RUNNER_OS" = "macOS" ]; then
             # ditto keeps the bundles' metadata intact
             ditto -c -k --sequesterRsrc dist "release/$name"
@@ -100,12 +108,16 @@ jobs:
           path: release
 
   release:
-    # Runs only for version tags, after all three platforms built and passed their checks.
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Publishes a GitHub Release after all three platforms built and passed their checks.
+    # Two ways to start it:
+    #   - Actions tab -> Build -> Run workflow, enter a tag such as v1.2.0 (no command line needed)
+    #   - push a tag:  git tag v1.2.0 && git push origin v1.2.0
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     needs: build
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    concurrency: release-${{ inputs.release_tag || github.ref_name }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -116,10 +128,20 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           ls -l release
-          gh release create "$GITHUB_REF_NAME" release/*.zip \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Master Blaster $GITHUB_REF_NAME" \
-            --generate-notes \
-            --notes "Unsigned builds. macOS: copy the .component to ~/Library/Audio/Plug-Ins/Components and the .vst3 to ~/Library/Audio/Plug-Ins/VST3, then run: xattr -dr com.apple.quarantine on both. Windows: copy the .vst3 to C:\\Program Files\\Common Files\\VST3. Linux: copy the .vst3 to ~/.vst3."
+          case "$TAG" in v[0-9]*) ;; *) echo "Release tag must look like v1.2.0, got '$TAG'"; exit 1 ;; esac
+          notes="Unsigned builds. macOS: copy the .component to ~/Library/Audio/Plug-Ins/Components and the .vst3 to ~/Library/Audio/Plug-Ins/VST3, then run: xattr -dr com.apple.quarantine on both. Windows: copy the .vst3 to C:\\Program Files\\Common Files\\VST3. Linux: copy the .vst3 to ~/.vst3."
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            # Release already exists (e.g. created on the website): just attach or refresh the zips.
+            gh release upload "$TAG" release/*.zip --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            # Creates the tag at the commit that was just built and tested.
+            gh release create "$TAG" release/*.zip \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Master Blaster $TAG" \
+              --generate-notes \
+              --notes "$notes"
+          fi
